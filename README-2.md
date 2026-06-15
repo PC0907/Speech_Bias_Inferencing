@@ -1,75 +1,88 @@
-# ASR Fairness Eval — ali's slice (SeamlessM4T + Moonshine)
+# ASR Eval — Ali's slice
 
-Runs each model on a **deterministic 2-hour subset** of each language, writes a
-reference–prediction CSV per cell, and logs WER + CER to `summary.csv`. The
-aggregator turns those into the Language × Model matrix from the planning sheet.
+Three models, eight languages, a deterministic 2-hour subset each. Writes a
+reference–prediction CSV per cell and logs WER + CER to `summary.csv`.
 
-## What your two models can actually do
+## Coverage (what each model can actually do)
 
-| Language | SeamlessM4T v2 | Moonshine |
-|----------|:-:|:-:|
-| Hindi, Tamil, Urdu, Bengali | ✅ real ASR | ❌ no model |
-| Dogri, Kashmiri, Santali, Bodo | ❌ not a speech source | ❌ no model |
+| Language | SeamlessM4T v2 | Moonshine | IndicConformer |
+|----------|:-:|:-:|:-:|
+| Hindi, Tamil, Urdu, Bengali | ✅ | ❌ no model | ✅ |
+| Dogri, Kashmiri, Santali, Bodo | ❌ not a speech source | ❌ no model | ✅ |
 
-- **Moonshine** trains one monolingual model per language; the lineup is English +
-  Arabic/Chinese/Japanese/Korean/Spanish/Ukrainian/Vietnamese. **None of your 8
-  languages exist.** Every Moonshine cell is a coverage gap.
-- **SeamlessM4T v2** does ASR for ~96 languages incl. Hindi/Tamil/Urdu/Bengali,
-  but Dogri/Kashmiri/Santali/Bodo are not speech sources.
+- **Seamless** → real numbers only on Hi/Ta/Ur/Bn; the other four are coverage gaps.
+- **Moonshine** → no model exists for any of the eight; every cell is a gap
+  (use `--force` to run the English model anyway and record the garbage WER).
+- **IndicConformer** → covers all eight (it's trained on the 22 scheduled
+  languages). It is *not* a foundation model, though — see the note at the bottom.
 
-So you have **4 genuinely scoreable cells** (Seamless × Hi/Ta/Ur/Bn). The other 12
-are coverage gaps — which is a finding, not a failure.
+## Text handling is RAW
+
+No lowercasing, no punctuation stripping — nothing that could touch script-specific
+cues. Only two things are applied, and neither removes content:
+
+- **NFC** — canonical Unicode form, so identical-looking strings encoded with
+  different code-point orders don't count as errors (this *protects* the
+  low-resource scripts from false errors). Disable with `--byte-exact`.
+- **whitespace collapse** — tokenisation hygiene; stops stray double/trailing
+  spaces from inventing word errors.
+
+The raw `reference` and `prediction` columns are always saved untouched, so you can
+recompute under any scheme later without re-running inference.
 
 ## Install
 
 ```bash
 pip install -r requirements.txt
+# IndicConformer is gated:
+huggingface-cli login        # after accepting the terms on its HF model page
 ```
 
 ## Run
 
 ```bash
-# scored cells (real numbers)
-for L in hindi tamil urdu bengali; do
-    python asr_eval.py --model seamless --lang $L --hours 2 --out results
+# IndicConformer — the only model that gives you a full 8-language column
+for L in hindi tamil urdu bengali dogri kashmiri santali bodo; do
+    python asr_eval.py --model indicconformer --lang $L \
+        --data /content/drive/MyDrive/test_$L --decoder ctc --out results
 done
 
-# coverage gaps — logged as "unsupported" automatically, no GPU spent
-for L in dogri kashmiri santali bodo; do
-    python asr_eval.py --model seamless --lang $L --out results
+# Seamless — real on the first four, auto coverage-gap on the rest
+for L in hindi tamil urdu bengali; do
+    python asr_eval.py --model seamless --lang $L --data /content/drive/MyDrive/test_$L --out results
 done
+for L in dogri kashmiri santali bodo; do
+    python asr_eval.py --model seamless --lang $L --out results   # logged unsupported, no GPU spent
+done
+
+# Moonshine — all eight are coverage gaps
 for L in hindi tamil urdu bengali dogri kashmiri santali bodo; do
     python asr_eval.py --model moonshine --lang $L --out results
 done
-
-# OPTIONAL: force English Moonshine on the audio to record the garbage WER
-# (good supplementary "what if you misapply an English model" data point)
-python asr_eval.py --model moonshine --lang hindi --out results --force
 ```
 
-Build the matrices once everyone's `summary.csv` files are collected:
+`--data` takes either a local `load_from_disk` folder (your Drive copies) or a HF
+hub id (`XKaab/ASR-Hindi_7hrs`). Omit it to fall back to the sheet's hub id.
+
+Build the matrices:
 
 ```bash
-python aggregate.py results/summary.csv [teammates...] --metric WER --out matrix_wer.csv
-python aggregate.py results/summary.csv [teammates...] --metric CER --out matrix_cer.csv
+python aggregate.py results/summary.csv --metric WER --out matrix_wer.csv
+python aggregate.py results/summary.csv --metric CER --out matrix_cer.csv
 ```
 
-## Three things to get right (they affect the paper, not just the code)
+## Notes
 
-1. **Same 2-hour subset for every model.** Selection is deterministic (rows in
-   dataset order until ≥2h), so your Seamless and the team's Whisper/MMS all score
-   the *identical* clips. Don't shuffle — the comparison breaks otherwise.
-2. **One normalization scheme everywhere.** `normalize()` does NFC + punctuation
-   strip + whitespace collapse + lowercase, applied identically to every language.
-   Agree on this with the team so numbers are comparable. Cross-script garbage
-   (e.g. English output vs Devanagari reference) will read ~100% WER — that's
-   correct, not a bug.
-3. **WER is not clipped** and can exceed 100% on the coverage gaps. Report those as
-   coverage, not as a quality gradient. Your real RQ1 signal lives in the 4 scored
-   cells (and, across the full team, mainly in MMS, which is the only model that
-   reaches the tribal tier at all).
+- `--decoder rnnt` is usually a touch more accurate than `ctc`, a touch slower.
+- If IndicConformer's custom forward throws a device error, run it on CPU
+  (600M is slow but fine for 2 h) — remove the GPU; the adapter already falls back.
+- Verify the logic with no GPU/network: `python asr_eval.py --selftest`.
+- WER is not clipped and can exceed 100% on coverage gaps — that's correct;
+  report those as coverage, not as a quality gradient.
 
-## Where to plug in
-- Dataset repo names live in `LANGS` in `asr_eval.py` — fix any that differ.
-- If a dataset's text column isn't auto-detected, add its name to `TEXT_KEYS`.
-- Verify the run with no GPU/network: `python asr_eval.py --selftest`.
+**On IndicConformer and the paper:** it's a purpose-built, supervised Indic model,
+not a web-scale foundation model like the others. It'll likely score *well* on all
+eight — which makes it a counterpoint to the "foundation models exclude tribal
+languages" thesis, not a test of it. Report it as a clearly-labelled
+Indic-specialized reference / upper bound in its own row, not mixed into the
+foundation-model group.
