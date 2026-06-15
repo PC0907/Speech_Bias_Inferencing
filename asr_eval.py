@@ -1,124 +1,139 @@
 #!/usr/bin/env python3
 """
-ASR fairness eval harness  --  ali's slice: SeamlessM4T + Moonshine
--------------------------------------------------------------------
-For each (model, language) it:
-  1. streams the HF dataset, picks a DETERMINISTIC ~2h subset (shared across models),
-  2. runs inference,
-  3. writes a reference-prediction CSV,
-  4. appends WER + CER to summary.csv.
+ASR eval harness -- Ali's slice only.
 
-Coverage is encoded explicitly: cells the model cannot serve are logged as
-"unsupported" instead of being silently scored as ~100% WER. Use --force to run
-an unsupported cell anyway (e.g. English Moonshine on Hindi audio) and record the
-garbage number as a deliberate data point.
+Models:  seamless  |  moonshine  |  indicconformer
+Langs:   hindi tamil urdu bengali dogri kashmiri santali bodo
 
-Metrics are self-contained (standard word/char Levenshtein, can exceed 1.0) so no
-jiwer/torch is needed for scoring -> works on an offline HPC node.
+Coverage:  Seamless -> hi/ta/ur/bn only.  Moonshine -> none of the 8.
+           IndicConformer -> all 8.
 
-Run a model:
-    python asr_eval.py --model seamless --lang hindi --hours 2 --out results
-    python asr_eval.py --model moonshine --lang hindi --hours 2 --out results --force
+Per (model, language) it:
+  1. loads the dataset (a local load_from_disk path OR a HF hub id),
+  2. takes a deterministic ~2h subset,
+  3. runs inference,
+  4. writes a reference-prediction CSV with the RAW text kept untouched,
+  5. appends WER + CER to summary.csv.
 
-Verify the logic with no GPU / no network:
-    python asr_eval.py --selftest
+Text handling is RAW: no lowercasing, no punctuation stripping. Only NFC + a
+whitespace collapse are applied -- both are measurement hygiene and never remove
+content. Pass --byte-exact to also drop NFC. Metrics are self-contained (no jiwer
+or torch needed just to score), so you can compute offline.
+
+Examples:
+  python asr_eval.py --model indicconformer --lang santali --data /content/drive/MyDrive/test_santali
+  python asr_eval.py --model indicconformer --lang hindi   --data /content/drive/MyDrive/test_hindi --decoder rnnt
+  python asr_eval.py --model seamless --lang hindi --data XKaab/ASR-Hindi_7hrs
+  python asr_eval.py --model moonshine --lang hindi                 # auto-logged coverage gap
+  python asr_eval.py --selftest
 """
-import argparse, csv, json, os, re, sys, unicodedata
+import argparse, csv, os, re, sys, unicodedata
 
-# ----------------------------------------------------------------------------
-# Language registry. Edit the `hf` ids if your repo names differ slightly.
-# `seamless` = Seamless source-speech code, or None if NOT a supported speech
-# source. Moonshine has NO model for any of these 8, so it is handled separately.
-# ----------------------------------------------------------------------------
 LANGS = {
-    "hindi":    {"hf": "XKaab/ASR-Hindi_7hrs",    "seamless": "hin", "tier": "HRL"},
-    "tamil":    {"hf": "XKaab/ASR-Tamil_8hrs",    "seamless": "tam", "tier": "HRL"},
-    "urdu":     {"hf": "XKaab/ASR-Urdu_6hrs",     "seamless": "urd", "tier": "MRL"},
-    "bengali":  {"hf": "XKaab/ASR-Bengali_6hrs",  "seamless": "ben", "tier": "MRL"},
-    "dogri":    {"hf": "XKaab/ASR-Dogri_4hrs",    "seamless": None,  "tier": "LRL-Scheduled"},
-    "kashmiri": {"hf": "XKaab/ASR-Kashmiri_4hrs", "seamless": None,  "tier": "LRL-Scheduled"},
-    "santali":  {"hf": "XKaab/ASR-Santali_4hrs",  "seamless": None,  "tier": "LRL-Tribal"},
-    "bodo":     {"hf": "XKaab/ASR-Bodo_5hrs",     "seamless": None,  "tier": "LRL-Tribal"},
+    "hindi":    {"hub": "XKaab/ASR-Hindi_7hrs",    "seamless": "hin", "ic": "hi",  "tier": "HRL"},
+    "tamil":    {"hub": "XKaab/ASR-Tamil_8hrs",    "seamless": "tam", "ic": "ta",  "tier": "HRL"},
+    "urdu":     {"hub": "XKaab/ASR-Urdu_6hrs",     "seamless": "urd", "ic": "ur",  "tier": "MRL"},
+    "bengali":  {"hub": "XKaab/ASR-Bengali_6hrs",  "seamless": "ben", "ic": "bn",  "tier": "MRL"},
+    "dogri":    {"hub": "XKaab/ASR-Dogri_4hrs",    "seamless": None,  "ic": "doi", "tier": "LRL-Scheduled"},
+    "kashmiri": {"hub": "XKaab/ASR-Kashmiri_4hrs", "seamless": None,  "ic": "ks",  "tier": "LRL-Scheduled"},
+    "santali":  {"hub": "XKaab/ASR-Santali_4hrs",  "seamless": None,  "ic": "sat", "tier": "LRL-Tribal"},
+    "bodo":     {"hub": "XKaab/ASR-Bodo_5hrs",     "seamless": None,  "ic": "brx", "tier": "LRL-Tribal"},
 }
 
-# Candidate column names to auto-detect inside a HF dataset row.
 TEXT_KEYS  = ("sentence", "text", "transcription", "transcript", "normalized_text", "target")
 AUDIO_KEYS = ("audio", "speech", "wav")
 
-# ============================================================================
-# Metrics + normalization  (no external deps -- testable offline)
-# ============================================================================
-_PUNCT = re.compile(r"[।॥.,;:!?\"'`~@#$%^&*()\[\]{}<>/\\|_=+\u2013\u2014\u2026“”‘’]+")
-_WS    = re.compile(r"\s+")
+# --------------------------------------------------------------------------
+# Text prep -- RAW. No case folding, no punctuation removal. NFC + whitespace
+# only (neither removes linguistic content). --byte-exact turns NFC off too.
+# --------------------------------------------------------------------------
+_WS = re.compile(r"\s+")
+def prep(t, nfc=True):
+    t = str(t or "")
+    if nfc:
+        t = unicodedata.normalize("NFC", t)   # canonical form; prevents FALSE mismatches
+    return _WS.sub(" ", t).strip()            # tokenisation hygiene only
 
-def normalize(text, lower=True):
-    """NFC -> strip punctuation (Latin + Devanagari danda etc.) -> collapse ws."""
-    if text is None:
-        return ""
-    t = unicodedata.normalize("NFC", str(text))
-    t = _PUNCT.sub(" ", t)
-    if lower:
-        t = t.lower()
-    return _WS.sub(" ", t).strip()
-
-def _lev(ref, hyp):
-    """Levenshtein edit distance between two sequences."""
-    n, m = len(ref), len(hyp)
+# --------------------------------------------------------------------------
+# Metrics (self-contained; WER/CER are NOT clipped and can exceed 1.0)
+# --------------------------------------------------------------------------
+def _lev(a, b):
+    n, m = len(a), len(b)
     if n == 0:
         return m
     prev = list(range(m + 1))
     for i in range(1, n + 1):
         cur = [i] + [0] * m
-        ri = ref[i - 1]
+        ai = a[i - 1]
         for j in range(1, m + 1):
-            cost = 0 if ri == hyp[j - 1] else 1
-            cur[j] = min(prev[j] + 1, cur[j - 1] + 1, prev[j - 1] + cost)
+            cur[j] = min(prev[j] + 1, cur[j - 1] + 1,
+                         prev[j - 1] + (0 if ai == b[j - 1] else 1))
         prev = cur
     return prev[m]
 
 def wer(ref, hyp):
     r, h = ref.split(), hyp.split()
-    if not r:
-        return float(bool(h))
-    return _lev(r, h) / len(r)          # NOT clipped -- can exceed 1.0
+    return _lev(r, h) / len(r) if r else float(bool(h))
 
 def cer(ref, hyp):
-    r, h = list(ref), list(hyp)         # chars incl. single spaces (jiwer convention)
-    if not r:
-        return float(bool(h))
-    return _lev(r, h) / len(r)
+    r, h = list(ref), list(hyp)
+    return _lev(r, h) / len(r) if r else float(bool(h))
 
-def score(ref_raw, hyp_raw):
-    r, h = normalize(ref_raw), normalize(hyp_raw)
+def score(ref_raw, hyp_raw, nfc=True):
+    r, h = prep(ref_raw, nfc), prep(hyp_raw, nfc)
     return wer(r, h), cer(r, h), r, h
 
-# ============================================================================
-# Deterministic 2-hour subset (shared across all models -> fair comparison)
-# ============================================================================
-def select_subset(examples, target_seconds, audio_key):
-    """Take rows IN ORDER until accumulated audio >= target. Deterministic, so
-    every model (yours and the rest of the team's) scores the identical clips."""
-    selected, total = [], 0.0
-    for ex in examples:
-        a = ex[audio_key]
-        dur = len(a["array"]) / a["sampling_rate"]
-        selected.append(ex)
-        total += dur
-        if total >= target_seconds:
-            break
-    return selected, total
+# --------------------------------------------------------------------------
+def supported(model, lang):
+    if model == "seamless":
+        return LANGS[lang]["seamless"] is not None
+    if model == "indicconformer":
+        return True
+    if model == "moonshine":
+        return False
+    raise ValueError(model)
 
-def detect_key(row, candidates, kind):
-    for k in candidates:
+# --------------------------------------------------------------------------
+# Data: local folder (load_from_disk) or HF hub id (streaming)
+# --------------------------------------------------------------------------
+def load_any(data_ref, split):
+    from datasets import load_from_disk, load_dataset
+    if os.path.exists(data_ref):
+        ds = load_from_disk(data_ref)
+        if hasattr(ds, "column_names") and isinstance(ds.column_names, dict):  # DatasetDict
+            ds = ds[split] if split in ds else ds[list(ds.keys())[0]]
+        return ds
+    return load_dataset(data_ref, split=split, streaming=True)
+
+def detect_key(row, cands, kind):
+    for k in cands:
         if k in row:
             return k
-    raise KeyError(f"No {kind} column found. Row has: {list(row.keys())}. "
-                   f"Add the right name to {'TEXT_KEYS' if kind=='text' else 'AUDIO_KEYS'}.")
+    raise KeyError(f"No {kind} column in {list(row.keys())}; add it to "
+                   f"{'TEXT_KEYS' if kind == 'text' else 'AUDIO_KEYS'}.")
 
-# ============================================================================
-# Model adapters (need torch + transformers; imported lazily so --selftest
-# and offline scoring work without them)
-# ============================================================================
+def select_subset(rows, target_seconds, akey):
+    """Rows in dataset order until accumulated audio >= target. Deterministic."""
+    out, total = [], 0.0
+    for ex in rows:
+        a = ex[akey]
+        total += len(a["array"]) / a["sampling_rate"]
+        out.append(ex)
+        if total >= target_seconds:
+            break
+    return out, total
+
+def to_16k(array, sr):
+    import numpy as np
+    if sr == 16000:
+        return np.asarray(array, dtype="float32")
+    import torch, torchaudio
+    wav = torch.tensor(np.asarray(array, dtype="float32"))
+    return torchaudio.functional.resample(wav, sr, 16000).numpy()
+
+# --------------------------------------------------------------------------
+# Model adapters (heavy imports are lazy so --selftest / offline scoring work)
+# --------------------------------------------------------------------------
 def load_seamless(device):
     import torch
     from transformers import AutoProcessor, SeamlessM4Tv2ForSpeechToText
@@ -127,163 +142,159 @@ def load_seamless(device):
         "facebook/seamless-m4t-v2-large",
         torch_dtype=torch.float16 if device == "cuda" else torch.float32,
     ).to(device).eval()
-
-    def transcribe(audio16k, tgt_lang):
-        inputs = proc(audios=audio16k, sampling_rate=16000, return_tensors="pt").to(device)
+    def transcribe(audio16k, lang):
+        inp = proc(audios=audio16k, sampling_rate=16000, return_tensors="pt").to(device)
         with torch.no_grad():
-            toks = model.generate(**inputs, tgt_lang=tgt_lang)
+            toks = model.generate(**inp, tgt_lang=lang["seamless"])
         return proc.batch_decode(toks, skip_special_tokens=True)[0]
     return transcribe
 
 def load_moonshine(device):
     import torch
     from transformers import AutoProcessor, MoonshineForConditionalGeneration
-    # English model -- Moonshine has no Indic checkpoint. Used only with --force.
+    # English model -- Moonshine has no Indic checkpoint. Only used with --force.
     proc = AutoProcessor.from_pretrained("UsefulSensors/moonshine-base")
     model = MoonshineForConditionalGeneration.from_pretrained(
         "UsefulSensors/moonshine-base").to(device).eval()
-
-    def transcribe(audio16k, tgt_lang=None):
-        inputs = proc(audio16k, sampling_rate=16000, return_tensors="pt").to(device)
+    def transcribe(audio16k, lang):
+        inp = proc(audio16k, sampling_rate=16000, return_tensors="pt").to(device)
         with torch.no_grad():
-            toks = model.generate(**inputs, max_new_tokens=256)
+            toks = model.generate(**inp, max_new_tokens=256)
         return proc.batch_decode(toks, skip_special_tokens=True)[0]
     return transcribe
 
-def resample_16k(array, sr):
-    if sr == 16000:
-        return array
-    import numpy as np
+def load_indicconformer(device, decoder="ctc"):
+    import torch, numpy as np
+    from transformers import AutoModel
+    # gated model: accept terms on the HF page + `huggingface-cli login` first
+    model = AutoModel.from_pretrained(
+        "ai4bharat/indic-conformer-600m-multilingual", trust_remote_code=True).eval()
     try:
-        import librosa
-        return librosa.resample(np.asarray(array, dtype="float32"), orig_sr=sr, target_sr=16000)
+        model = model.to(device)
+    except Exception:
+        device = "cpu"
+    def transcribe(audio16k, lang):
+        wav = torch.tensor(np.asarray(audio16k, dtype="float32")).unsqueeze(0)  # (1, T)
+        try:
+            wav = wav.to(device)
+        except Exception:
+            pass
+        with torch.no_grad():
+            out = model(wav, lang["ic"], decoder)          # returns transcription string
+        return out[0] if isinstance(out, (list, tuple)) else out
+    return transcribe
+
+LOADERS = {"seamless": load_seamless, "moonshine": load_moonshine,
+           "indicconformer": load_indicconformer}
+
+def _cuda():
+    try:
+        import torch
+        return torch.cuda.is_available()
     except ImportError:
-        # linear fallback if librosa is unavailable
-        x = np.asarray(array, dtype="float32")
-        n = int(round(len(x) * 16000 / sr))
-        return np.interp(np.linspace(0, len(x) - 1, n), np.arange(len(x)), x).astype("float32")
+        return False
 
-# ============================================================================
-# Supportedness
-# ============================================================================
-def supported(model, lang):
-    if model == "seamless":
-        return LANGS[lang]["seamless"] is not None
-    if model == "moonshine":
-        return False               # no Moonshine model exists for any of the 8
-    raise ValueError(model)
-
-# ============================================================================
-# Main run
-# ============================================================================
-def run(model_name, lang, hours, out_dir, split, force, subset_file):
+# --------------------------------------------------------------------------
+def run(model_name, lang, hours, out_dir, split, force, data_ref, decoder, nfc):
     os.makedirs(out_dir, exist_ok=True)
     info = LANGS[lang]
-    is_supported = supported(model_name, lang)
+    ok = supported(model_name, lang)
 
-    if not is_supported and not force:
-        _append_summary(out_dir, model_name, lang, info["tier"],
-                        n=0, hrs=0.0, w="", c="", status="unsupported")
+    if not ok and not force:
+        _summary(out_dir, model_name, lang, info["tier"], 0, 0.0, "", "", "unsupported")
         print(f"[{model_name}/{lang}] UNSUPPORTED -> logged as coverage gap "
               f"(use --force to run anyway and record the garbage WER).")
         return
 
-    from datasets import load_dataset
-    ds = load_dataset(info["hf"], split=split, streaming=True)
+    data_ref = data_ref or info["hub"]
+    ds = load_any(data_ref, split)
     first = next(iter(ds))
     akey = detect_key(first, AUDIO_KEYS, "audio")
     tkey = detect_key(first, TEXT_KEYS, "text")
-    print(f"[{model_name}/{lang}] audio col='{akey}'  text col='{tkey}'")
-
-    # deterministic subset (reuse a saved id list if provided)
-    ds = load_dataset(info["hf"], split=split, streaming=True)
-    rows, total_sec = select_subset(ds, hours * 3600, akey)
-    print(f"[{model_name}/{lang}] selected {len(rows)} utts  ({total_sec/3600:.2f} h)")
+    ds = load_any(data_ref, split)                          # restart iterator
+    rows, total = select_subset(ds, hours * 3600, akey)
+    print(f"[{model_name}/{lang}] {len(rows)} utts ({total/3600:.2f} h)  "
+          f"audio='{akey}' text='{tkey}'  data='{data_ref}'")
 
     device = "cuda" if _cuda() else "cpu"
-    transcribe = (load_seamless if model_name == "seamless" else load_moonshine)(device)
-    tgt = info["seamless"]
+    transcribe = (load_indicconformer(device, decoder) if model_name == "indicconformer"
+                  else LOADERS[model_name](device))
 
-    rows_out, W, C = [], [], []
+    out_rows, W, C = [], [], []
     for i, ex in enumerate(rows):
         a = ex[akey]
-        audio = resample_16k(a["array"], a["sampling_rate"])
+        audio = to_16k(a["array"], a["sampling_rate"])
         try:
-            hyp = transcribe(audio, tgt)
-        except Exception as e:                       # unsupported lang code etc.
+            hyp = transcribe(audio, info)
+        except Exception as e:
             hyp = ""
             print(f"  utt {i}: inference error -> empty hyp ({e})")
         ref = ex.get(tkey, "")
-        w, c, rn, hn = score(ref, hyp)
+        w, c, rp, hp = score(ref, hyp, nfc)
         W.append(w); C.append(c)
-        rows_out.append({"idx": i, "reference": ref, "prediction": hyp,
-                         "ref_norm": rn, "hyp_norm": hn,
+        out_rows.append({"idx": i, "reference": ref, "prediction": hyp,   # RAW, untouched
+                         "ref_prep": rp, "hyp_prep": hp,
                          "wer": round(w, 4), "cer": round(c, 4)})
 
-    pred_path = os.path.join(out_dir, f"{model_name}__{lang}.csv")
-    with open(pred_path, "w", newline="", encoding="utf-8") as f:
-        wtr = csv.DictWriter(f, fieldnames=list(rows_out[0].keys()))
-        wtr.writeheader(); wtr.writerows(rows_out)
+    if not out_rows:
+        print(f"[{model_name}/{lang}] no rows scored."); return
 
-    agg_w = sum(W) / len(W); agg_c = sum(C) / len(C)
-    status = "scored" if is_supported else "forced(unsupported)"
-    _append_summary(out_dir, model_name, lang, info["tier"],
-                    n=len(rows_out), hrs=total_sec/3600,
-                    w=round(agg_w, 4), c=round(agg_c, 4), status=status)
-    print(f"[{model_name}/{lang}] WER={agg_w:.4f}  CER={agg_c:.4f}  -> {pred_path}")
+    p = os.path.join(out_dir, f"{model_name}__{lang}.csv")
+    with open(p, "w", newline="", encoding="utf-8") as f:
+        w_ = csv.DictWriter(f, fieldnames=list(out_rows[0].keys()))
+        w_.writeheader(); w_.writerows(out_rows)
 
-def _append_summary(out_dir, model, lang, tier, n, hrs, w, c, status):
-    path = os.path.join(out_dir, "summary.csv")
-    new = not os.path.exists(path)
-    with open(path, "a", newline="", encoding="utf-8") as f:
-        wtr = csv.writer(f)
+    aw, ac = sum(W) / len(W), sum(C) / len(C)
+    _summary(out_dir, model_name, lang, info["tier"], len(out_rows), total / 3600,
+             round(aw, 4), round(ac, 4), "scored" if ok else "forced(unsupported)")
+    print(f"[{model_name}/{lang}] WER={aw:.4f}  CER={ac:.4f}  -> {p}")
+
+def _summary(out_dir, model, lang, tier, n, hrs, w, c, status):
+    p = os.path.join(out_dir, "summary.csv")
+    new = not os.path.exists(p)
+    with open(p, "a", newline="", encoding="utf-8") as f:
+        wr = csv.writer(f)
         if new:
-            wtr.writerow(["model", "language", "tier", "n_utts",
-                          "audio_hours", "WER", "CER", "status"])
-        wtr.writerow([model, lang, tier, n, round(hrs, 3), w, c, status])
+            wr.writerow(["model", "language", "tier", "n_utts",
+                         "audio_hours", "WER", "CER", "status"])
+        wr.writerow([model, lang, tier, n, round(hrs, 3), w, c, status])
 
-def _cuda():
-    try:
-        import torch; return torch.cuda.is_available()
-    except ImportError:
-        return False
-
-# ============================================================================
-# Self-test (no GPU, no network, no torch)
-# ============================================================================
+# --------------------------------------------------------------------------
 def selftest():
-    assert normalize("Hello,  World!") == "hello world"
-    assert normalize("नमस्ते।") == "नमस्ते"
-    assert abs(wer("the cat sat", "the cat sat") - 0.0)      < 1e-9
-    assert abs(wer("the cat sat", "the dog sat") - 1/3)      < 1e-9
-    assert abs(wer("a b c d", "") - 1.0)                     < 1e-9
-    assert abs(wer("a", "a b c") - 2.0)                      < 1e-9   # >100% allowed
-    assert abs(cer("abc", "abd") - 1/3)                      < 1e-9
-    # subsetting determinism + duration cutoff
+    assert prep("Hello,  World!") == "Hello, World!"    # punctuation & case KEPT
+    assert prep("क।") == "क।"                            # danda kept; NFC-safe
+    assert prep("a\t b\n c") == "a b c"                 # whitespace collapsed
+    assert abs(wer("the cat sat", "the dog sat") - 1/3) < 1e-9
+    assert abs(wer("a", "a b c") - 2.0) < 1e-9          # >100% allowed
+    assert abs(cer("abc", "abd") - 1/3) < 1e-9
     fake = [{"audio": {"array": [0.0]*16000, "sampling_rate": 16000}} for _ in range(10)]
-    sel, tot = select_subset(iter(fake), target_seconds=3, audio_key="audio")
-    assert len(sel) == 3 and abs(tot - 3.0) < 1e-9, (len(sel), tot)
-    # supportedness matrix
+    sel, tot = select_subset(iter(fake), 3, "audio")
+    assert len(sel) == 3 and abs(tot - 3.0) < 1e-9
     assert supported("seamless", "hindi") and not supported("seamless", "santali")
-    assert not supported("moonshine", "hindi")
+    assert supported("indicconformer", "santali") and not supported("moonshine", "hindi")
     print("OK: all self-tests passed.")
 
-# ============================================================================
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--model", choices=["seamless", "moonshine"])
+    ap = argparse.ArgumentParser(
+        description="Ali's ASR eval. Seamless=hi/ta/ur/bn, Moonshine=none, IndicConformer=all 8.")
+    ap.add_argument("--model", choices=list(LOADERS))
     ap.add_argument("--lang", choices=list(LANGS))
+    ap.add_argument("--data", default=None,
+                    help="local load_from_disk path OR a HF hub id (default: the sheet's hub id)")
     ap.add_argument("--hours", type=float, default=2.0)
     ap.add_argument("--out", default="results")
     ap.add_argument("--split", default="train")
+    ap.add_argument("--decoder", choices=["ctc", "rnnt"], default="ctc",
+                    help="IndicConformer decoding strategy (ignored by other models)")
     ap.add_argument("--force", action="store_true",
                     help="run an unsupported cell anyway and record the garbage WER")
-    ap.add_argument("--subset-file", default=None)
+    ap.add_argument("--byte-exact", action="store_true",
+                    help="disable NFC as well (truly raw byte comparison)")
     ap.add_argument("--selftest", action="store_true")
-    args = ap.parse_args()
+    a = ap.parse_args()
 
-    if args.selftest:
+    if a.selftest:
         selftest(); sys.exit(0)
-    if not (args.model and args.lang):
+    if not (a.model and a.lang):
         ap.error("--model and --lang are required (or use --selftest)")
-    run(args.model, args.lang, args.hours, args.out, args.split, args.force, args.subset_file)
+    run(a.model, a.lang, a.hours, a.out, a.split, a.force, a.data, a.decoder, not a.byte_exact)
