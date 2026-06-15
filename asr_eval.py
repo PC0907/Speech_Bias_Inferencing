@@ -163,7 +163,10 @@ def load_seamless(device):
         torch_dtype=torch.float16 if device == "cuda" else torch.float32,
     ).to(device).eval()
     def transcribe(audio16k, lang):
-        inp = proc(audios=audio16k, sampling_rate=16000, return_tensors="pt").to(device)
+        try:                                       # newer transformers: audio=
+            inp = proc(audio=audio16k, sampling_rate=16000, return_tensors="pt").to(device)
+        except TypeError:                          # older transformers: audios=
+            inp = proc(audios=audio16k, sampling_rate=16000, return_tensors="pt").to(device)
         with torch.no_grad():
             toks = model.generate(**inp, tgt_lang=lang["seamless"])
         return proc.batch_decode(toks, skip_special_tokens=True)[0]
