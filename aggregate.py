@@ -1,17 +1,15 @@
 #!/usr/bin/env python3
 """
-Build the Language x Model matrix from one or more summary.csv files.
+Build Ali's Language x Model matrix from results/summary.csv.
 
-    python aggregate.py results/summary.csv [teammate1.csv teammate2.csv ...] \
-           --metric WER --out matrix_wer.csv
+    python aggregate.py results/summary.csv --metric WER --out matrix_wer.csv
+    python aggregate.py results/summary.csv --metric CER --out matrix_cer.csv
 
-Unsupported cells are written as "n/a" so coverage gaps stay visually distinct
-from real scores. Pass --metric CER for the character-error matrix.
+Unsupported cells are written as "n/a" so coverage gaps stay distinct from scores.
 """
 import argparse, csv, collections
 
-MODEL_ORDER = ["parakeet", "nemotron", "sensevoice", "mms",
-               "moonshine", "seamless", "speecht5", "whisper"]
+MODEL_ORDER = ["seamless", "moonshine", "indicconformer"]   # Ali's slice
 LANG_ORDER  = ["hindi", "tamil", "urdu", "bengali",
                "dogri", "kashmiri", "santali", "bodo"]
 
@@ -22,19 +20,17 @@ def main():
     ap.add_argument("--out", default="matrix.csv")
     args = ap.parse_args()
 
-    cell = collections.defaultdict(dict)        # cell[lang][model] = value or "n/a"
-    models_seen = set()
+    cell = collections.defaultdict(dict)
+    seen = set()
     for path in args.inputs:
         with open(path, encoding="utf-8") as f:
             for r in csv.DictReader(f):
                 m, lg = r["model"].lower(), r["language"].lower()
-                models_seen.add(m)
+                seen.add(m)
                 cell[lg][m] = "n/a" if r["status"] == "unsupported" else r[args.metric]
 
-    models = [m for m in MODEL_ORDER if m in models_seen] + \
-             sorted(models_seen - set(MODEL_ORDER))
-    langs  = [l for l in LANG_ORDER if l in cell] + \
-             sorted(set(cell) - set(LANG_ORDER))
+    models = [m for m in MODEL_ORDER if m in seen] + sorted(seen - set(MODEL_ORDER))
+    langs  = [l for l in LANG_ORDER if l in cell] + sorted(set(cell) - set(LANG_ORDER))
 
     with open(args.out, "w", newline="", encoding="utf-8") as f:
         w = csv.writer(f)
