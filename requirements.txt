@@ -1,0 +1,14 @@
+torch>=2.1
+transformers>=4.49        # SeamlessM4Tv2 + Moonshine need a recent build
+datasets>=2.18
+torchaudio                # resampling to 16 kHz
+sentencepiece             # SeamlessM4T tokenizer
+
+# IndicConformer runs custom_code via trust_remote_code and pulls ONNX:
+onnx==1.20.1
+onnxruntime-gpu==1.20.1   # use onnxruntime==1.20.1 instead if you have no GPU
+
+numpy
+
+# Note: WER/CER are built into asr_eval.py (no jiwer needed), so you can score
+# offline on an HPC node even without torch/transformers installed.
