@@ -1,39 +1,44 @@
 #!/usr/bin/env python3
 """
-ASR eval harness -- Ali's slice (seamless | moonshine | indicconformer).
+ASR eval harness -- Ali's slice (seamless | owsm | indicconformer).
+Moonshine retired (English-only, covered none of the 8).
 
-Dataset schema is IndicVoices-style: the audio lives in the `audio_filepath`
-column as a torchcodec AudioDecoder (not a classic {"array","sampling_rate"}
-dict), there's a `duration` field, and references come in `normalized` /
-`verbatim` / `text`. All of that is handled below.
+Coverage:
+  Seamless        -> hi/ta/ur/bn only
+  OWSM-CTC        -> hi/ta/ur/bn only (open Whisper-style foundation model)
+  IndicConformer  -> all 8
 
-Per (model, language): load -> deterministic ~2h subset (by the `duration`
-field) -> inference -> reference-prediction CSV (raw text kept) -> WER+CER row.
+Dataset is IndicVoices-style: audio in `audio_filepath` as a torchcodec
+AudioDecoder, a `duration` field, references in `normalized`/`verbatim`/`text`.
 
-Text handling is RAW: no case folding, no punctuation removal; only NFC +
-whitespace collapse (hygiene, never removes content). --byte-exact drops NFC.
+Per (model, language): load -> deterministic ~2h subset (by `duration`) ->
+inference -> reference-prediction CSV (raw text kept) -> WER+CER row.
+
+Text handling is RAW: NFC + whitespace collapse only (--byte-exact drops NFC).
 Metrics are self-contained, so scoring needs no jiwer/torch.
 
 Examples:
-  python asr_eval.py --model indicconformer --lang hindi --split valid
-  python asr_eval.py --model seamless --lang hindi --split valid --text-field verbatim
-  python asr_eval.py --model moonshine --lang santali             # coverage gap
+  python asr_eval.py --model indicconformer --lang santali
+  python asr_eval.py --model owsm --lang hindi
+  python asr_eval.py --model seamless --lang bengali --text-field verbatim
   python asr_eval.py --selftest
 """
 import argparse, csv, os, re, sys, unicodedata
 
+MODELS = ["seamless", "owsm", "indicconformer"]
+OWSM_MODEL = "espnet/owsm_ctc_v3.1_1B"          # or espnet/owsm_ctc_v4_1B (newer)
+
 LANGS = {
-    "hindi":    {"hub": "XKaab/ASR-Hindi_7hrs",    "seamless": "hin", "ic": "hi",  "tier": "HRL"},
-    "tamil":    {"hub": "XKaab/ASR-Tamil_8hrs",    "seamless": "tam", "ic": "ta",  "tier": "HRL"},
-    "urdu":     {"hub": "XKaab/ASR-Urdu_6hrs",     "seamless": "urd", "ic": "ur",  "tier": "MRL"},
-    "bengali":  {"hub": "XKaab/ASR-Bengali_6hrs",  "seamless": "ben", "ic": "bn",  "tier": "MRL"},
-    "dogri":    {"hub": "XKaab/ASR-Dogri_4hrs",    "seamless": None,  "ic": "doi", "tier": "LRL-Scheduled"},
-    "kashmiri": {"hub": "XKaab/ASR-Kashmiri_4hrs", "seamless": None,  "ic": "ks",  "tier": "LRL-Scheduled"},
-    "santali":  {"hub": "XKaab/ASR-Santali_4hrs",  "seamless": None,  "ic": "sat", "tier": "LRL-Tribal"},
-    "bodo":     {"hub": "XKaab/ASR-Bodo_5hrs",     "seamless": None,  "ic": "brx", "tier": "LRL-Tribal"},
+    "hindi":    {"hub": "XKaab/ASR-Hindi_7hrs",    "seamless": "hin", "owsm": "hin", "ic": "hi",  "tier": "HRL"},
+    "tamil":    {"hub": "XKaab/ASR-Tamil_8hrs",    "seamless": "tam", "owsm": "tam", "ic": "ta",  "tier": "HRL"},
+    "urdu":     {"hub": "XKaab/ASR-Urdu_6hrs",     "seamless": "urd", "owsm": "urd", "ic": "ur",  "tier": "MRL"},
+    "bengali":  {"hub": "XKaab/ASR-Bengali_6hrs",  "seamless": "ben", "owsm": "ben", "ic": "bn",  "tier": "MRL"},
+    "dogri":    {"hub": "XKaab/ASR-Dogri_4hrs",    "seamless": None,  "owsm": None,  "ic": "doi", "tier": "LRL-Scheduled"},
+    "kashmiri": {"hub": "XKaab/ASR-Kashmiri_4hrs", "seamless": None,  "owsm": None,  "ic": "ks",  "tier": "LRL-Scheduled"},
+    "santali":  {"hub": "XKaab/ASR-Santali_4hrs",  "seamless": None,  "owsm": None,  "ic": "sat", "tier": "LRL-Tribal"},
+    "bodo":     {"hub": "XKaab/ASR-Bodo_5hrs",     "seamless": None,  "owsm": None,  "ic": "brx", "tier": "LRL-Tribal"},
 }
 
-# audio column is "audio_filepath" in this schema; keep the common names too
 AUDIO_KEYS = ("audio_filepath", "audio", "speech", "wav")
 TEXT_KEYS  = ("normalized", "text", "verbatim", "sentence", "transcription", "transcript")
 DUR_KEYS   = ("duration", "length", "secs")
@@ -81,28 +86,28 @@ def score(ref_raw, hyp_raw, nfc=True):
 def supported(model, lang):
     if model == "seamless":
         return LANGS[lang]["seamless"] is not None
+    if model == "owsm":
+        return LANGS[lang]["owsm"] is not None
     if model == "indicconformer":
         return True
-    if model == "moonshine":
-        return False
     raise ValueError(model)
 
 # --------------------------------------------------------------------------
-# Audio: handle torchcodec AudioDecoder, classic dict, or a file path
+# Audio: torchcodec AudioDecoder, classic dict, or a file path
 # --------------------------------------------------------------------------
 def extract_audio(a):
     import numpy as np
-    if isinstance(a, dict) and "array" in a:                 # classic datasets format
+    if isinstance(a, dict) and "array" in a:
         arr, sr = np.asarray(a["array"], dtype="float32"), int(a["sampling_rate"])
-    elif hasattr(a, "get_all_samples"):                      # torchcodec AudioDecoder
+    elif hasattr(a, "get_all_samples"):
         s = a.get_all_samples()
         arr, sr = s.data.detach().cpu().numpy(), int(s.sample_rate)
-    elif isinstance(a, str):                                 # plain path
+    elif isinstance(a, str):
         import soundfile as sf
         arr, sr = sf.read(a, dtype="float32")
     else:
         raise TypeError(f"Unrecognised audio value of type {type(a)}")
-    if getattr(arr, "ndim", 1) == 2:                         # -> mono
+    if getattr(arr, "ndim", 1) == 2:
         arr = arr.mean(axis=0 if arr.shape[0] < arr.shape[1] else 1)
     return arr.astype("float32"), sr
 
@@ -138,8 +143,6 @@ def pick_text_key(row, preferred):
     return detect_key(row, TEXT_KEYS, "text")
 
 def select_subset(rows, target_seconds, akey, dur_key):
-    """Rows in order until accumulated audio >= target. Uses the duration field
-    when present (no decoding); else decodes to measure. Deterministic."""
     out, total = [], 0.0
     for ex in rows:
         if dur_key and ex.get(dur_key) is not None:
@@ -154,7 +157,7 @@ def select_subset(rows, target_seconds, akey, dur_key):
 # --------------------------------------------------------------------------
 # Model adapters (lazy heavy imports)
 # --------------------------------------------------------------------------
-def load_seamless(device):
+def load_seamless(device, info):
     import torch
     from transformers import AutoProcessor, SeamlessM4Tv2ForSpeechToText
     proc = AutoProcessor.from_pretrained("facebook/seamless-m4t-v2-large")
@@ -172,20 +175,21 @@ def load_seamless(device):
         return proc.batch_decode(toks, skip_special_tokens=True)[0]
     return transcribe
 
-def load_moonshine(device):
-    import torch
-    from transformers import AutoProcessor, MoonshineForConditionalGeneration
-    proc = AutoProcessor.from_pretrained("UsefulSensors/moonshine-base")
-    model = MoonshineForConditionalGeneration.from_pretrained(
-        "UsefulSensors/moonshine-base").to(device).eval()
+def load_owsm(device, info):
+    import numpy as np
+    from espnet2.bin.s2t_inference_ctc import Speech2TextGreedySearch
+    s2t = Speech2TextGreedySearch.from_pretrained(
+        OWSM_MODEL, device=device, use_flash_attn=False,
+        lang_sym=f"<{info['owsm']}>", task_sym="<asr>",
+    )
     def transcribe(audio16k, lang):
-        inp = proc(audio16k, sampling_rate=16000, return_tensors="pt").to(device)
-        with torch.no_grad():
-            toks = model.generate(**inp, max_new_tokens=256)
-        return proc.batch_decode(toks, skip_special_tokens=True)[0]
+        # batch_decode pads <30s to 30s and splits longer audio automatically;
+        # a single 1-D array returns a single string.
+        return s2t.batch_decode(np.asarray(audio16k, dtype="float32"),
+                                batch_size=1, context_len_in_secs=4)
     return transcribe
 
-def load_indicconformer(device, decoder="ctc"):
+def load_indicconformer(device, info, decoder="ctc"):
     import torch, numpy as np
     from transformers import AutoModel
     model = AutoModel.from_pretrained(
@@ -204,9 +208,6 @@ def load_indicconformer(device, decoder="ctc"):
             out = model(wav, lang["ic"], decoder)
         return out[0] if isinstance(out, (list, tuple)) else out
     return transcribe
-
-LOADERS = {"seamless": load_seamless, "moonshine": load_moonshine,
-           "indicconformer": load_indicconformer}
 
 def _cuda():
     try:
@@ -233,14 +234,18 @@ def run(model_name, lang, hours, out_dir, split, force, data_ref, decoder, nfc, 
     tkey = pick_text_key(first, text_field)
     dkey = next((k for k in DUR_KEYS if k in first), None)
 
-    ds = load_any(data_ref, split)                          # restart iterator
+    ds = load_any(data_ref, split)
     rows, total = select_subset(ds, hours * 3600, akey, dkey)
     print(f"[{model_name}/{lang}] {len(rows)} utts ({total/3600:.2f} h)  "
           f"audio='{akey}' text='{tkey}' dur='{dkey}'  data='{data_ref}'")
 
     device = "cuda" if _cuda() else "cpu"
-    transcribe = (load_indicconformer(device, decoder) if model_name == "indicconformer"
-                  else LOADERS[model_name](device))
+    if model_name == "indicconformer":
+        transcribe = load_indicconformer(device, info, decoder)
+    elif model_name == "owsm":
+        transcribe = load_owsm(device, info)
+    else:
+        transcribe = load_seamless(device, info)
 
     out_rows, W, C = [], [], []
     for i, ex in enumerate(rows):
@@ -294,14 +299,15 @@ def selftest():
              "duration": 1.0} for _ in range(10)]
     sel, tot = select_subset(iter(fake), 3, "audio_filepath", "duration")
     assert len(sel) == 3 and abs(tot - 3.0) < 1e-9
-    assert pick_text_key({"normalized": "x", "verbatim": "y"}, "verbatim") == "verbatim"
-    assert pick_text_key({"text": "x"}, "normalized") == "text"   # fallback when missing
-    assert supported("indicconformer", "santali") and not supported("moonshine", "hindi")
+    assert pick_text_key({"normalized": "x"}, "verbatim") == "normalized"  # fallback
+    assert supported("seamless", "hindi") and not supported("seamless", "santali")
+    assert supported("owsm", "hindi") and not supported("owsm", "santali")
+    assert supported("indicconformer", "santali")
     print("OK: all self-tests passed.")
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Ali's ASR eval harness.")
-    ap.add_argument("--model", choices=list(LOADERS))
+    ap = argparse.ArgumentParser(description="Ali's ASR eval (seamless | owsm | indicconformer).")
+    ap.add_argument("--model", choices=MODELS)
     ap.add_argument("--lang", choices=list(LANGS))
     ap.add_argument("--data", default=None, help="local path or HF hub id (default: sheet's hub id)")
     ap.add_argument("--hours", type=float, default=2.0)
