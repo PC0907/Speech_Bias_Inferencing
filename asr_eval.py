@@ -39,6 +39,11 @@ LANGS = {
     "bodo":     {"hub": "XKaab/ASR-Bodo_5hrs",     "seamless": None,  "owsm": None,  "ic": "brx", "tier": "LRL-Tribal"},
 }
 
+# When forcing a model onto a language it doesn't support, decode with a nearest
+# major language's code (script-based default; override with --force-lang).
+# Devanagari Indo-Aryan/Tibeto-Burman -> Hindi; Perso-Arabic Kashmiri -> Urdu.
+PROXY = {"dogri": "hindi", "bodo": "hindi", "santali": "hindi", "kashmiri": "urdu"}
+
 AUDIO_KEYS = ("audio_filepath", "audio", "speech", "wav")
 TEXT_KEYS  = ("normalized", "text", "verbatim", "sentence", "transcription", "transcript")
 DUR_KEYS   = ("duration", "length", "secs")
@@ -217,7 +222,7 @@ def _cuda():
         return False
 
 # --------------------------------------------------------------------------
-def run(model_name, lang, hours, out_dir, split, force, data_ref, decoder, nfc, text_field):
+def run(model_name, lang, hours, out_dir, split, force, data_ref, decoder, nfc, text_field, force_lang):
     os.makedirs(out_dir, exist_ok=True)
     info = LANGS[lang]
     ok = supported(model_name, lang)
@@ -226,6 +231,17 @@ def run(model_name, lang, hours, out_dir, split, force, data_ref, decoder, nfc, 
         _summary(out_dir, model_name, lang, info["tier"], 0, 0.0, "", "", "unsupported")
         print(f"[{model_name}/{lang}] UNSUPPORTED -> coverage gap (use --force to run anyway).")
         return
+
+    # Forcing an unsupported language: decode with a proxy language's code.
+    model_info, proxy_note = info, ""
+    if not ok and force:
+        pkey = force_lang or PROXY.get(lang)
+        if pkey:
+            p = LANGS[pkey]
+            model_info = {**info, "seamless": p["seamless"], "owsm": p["owsm"], "ic": p["ic"]}
+            proxy_note = pkey
+            print(f"[{model_name}/{lang}] FORCED via '{pkey}' "
+                  f"(transcribing {lang} audio with {pkey}'s decoder).")
 
     data_ref = data_ref or info["hub"]
     ds = load_any(data_ref, split)
@@ -241,17 +257,17 @@ def run(model_name, lang, hours, out_dir, split, force, data_ref, decoder, nfc, 
 
     device = "cuda" if _cuda() else "cpu"
     if model_name == "indicconformer":
-        transcribe = load_indicconformer(device, info, decoder)
+        transcribe = load_indicconformer(device, model_info, decoder)
     elif model_name == "owsm":
-        transcribe = load_owsm(device, info)
+        transcribe = load_owsm(device, model_info)
     else:
-        transcribe = load_seamless(device, info)
+        transcribe = load_seamless(device, model_info)
 
     out_rows, W, C = [], [], []
     for i, ex in enumerate(rows):
         try:
             audio, sr = extract_audio(ex[akey])
-            hyp = transcribe(to_16k(audio, sr), info)
+            hyp = transcribe(to_16k(audio, sr), model_info)
         except Exception as e:
             hyp = ""
             print(f"  utt {i}: error -> empty hyp ({e})")
@@ -271,8 +287,9 @@ def run(model_name, lang, hours, out_dir, split, force, data_ref, decoder, nfc, 
         w_.writeheader(); w_.writerows(out_rows)
 
     aw, ac = sum(W) / len(W), sum(C) / len(C)
+    status = "scored" if ok else (f"forced(via {proxy_note})" if proxy_note else "forced")
     _summary(out_dir, model_name, lang, info["tier"], len(out_rows), total / 3600,
-             round(aw, 4), round(ac, 4), "scored" if ok else "forced(unsupported)")
+             round(aw, 4), round(ac, 4), status)
     print(f"[{model_name}/{lang}] WER={aw:.4f}  CER={ac:.4f}  (ref='{tkey}')  -> {p}")
 
 def _summary(out_dir, model, lang, tier, n, hrs, w, c, status):
@@ -317,7 +334,10 @@ if __name__ == "__main__":
                     help="reference column: normalized | verbatim | text")
     ap.add_argument("--decoder", choices=["ctc", "rnnt"], default="ctc",
                     help="IndicConformer only")
-    ap.add_argument("--force", action="store_true", help="run an unsupported cell anyway")
+    ap.add_argument("--force", action="store_true",
+                    help="run an unsupported cell anyway (decodes via a proxy language)")
+    ap.add_argument("--force-lang", default=None, choices=list(LANGS),
+                    help="proxy language whose code to use when forcing (default: script-based)")
     ap.add_argument("--byte-exact", action="store_true", help="disable NFC too")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
@@ -327,4 +347,4 @@ if __name__ == "__main__":
     if not (a.model and a.lang):
         ap.error("--model and --lang are required (or use --selftest)")
     run(a.model, a.lang, a.hours, a.out, a.split, a.force, a.data,
-        a.decoder, not a.byte_exact, a.text_field)
+        a.decoder, not a.byte_exact, a.text_field, a.force_lang)
