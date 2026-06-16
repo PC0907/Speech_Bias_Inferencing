@@ -1,88 +1,62 @@
 # ASR Eval — Ali's slice
 
-Three models, eight languages, a deterministic 2-hour subset each. Writes a
+Models: **seamless | owsm | indicconformer** (Moonshine retired — English-only,
+covered none of the 8). Deterministic 2-hour subset per language; writes a
 reference–prediction CSV per cell and logs WER + CER to `summary.csv`.
 
-## Coverage (what each model can actually do)
+## Coverage
 
-| Language | SeamlessM4T v2 | Moonshine | IndicConformer |
+| Language | SeamlessM4T v2 | OWSM-CTC | IndicConformer |
 |----------|:-:|:-:|:-:|
-| Hindi, Tamil, Urdu, Bengali | ✅ | ❌ no model | ✅ |
-| Dogri, Kashmiri, Santali, Bodo | ❌ not a speech source | ❌ no model | ✅ |
+| Hindi, Tamil, Urdu, Bengali | ✅ | ✅ | ✅ |
+| Dogri, Kashmiri, Santali, Bodo | ❌ | ❌ | ✅ |
 
-- **Seamless** → real numbers only on Hi/Ta/Ur/Bn; the other four are coverage gaps.
-- **Moonshine** → no model exists for any of the eight; every cell is a gap
-  (use `--force` to run the English model anyway and record the garbage WER).
-- **IndicConformer** → covers all eight (it's trained on the 22 scheduled
-  languages). It is *not* a foundation model, though — see the note at the bottom.
-
-## Text handling is RAW
-
-No lowercasing, no punctuation stripping — nothing that could touch script-specific
-cues. Only two things are applied, and neither removes content:
-
-- **NFC** — canonical Unicode form, so identical-looking strings encoded with
-  different code-point orders don't count as errors (this *protects* the
-  low-resource scripts from false errors). Disable with `--byte-exact`.
-- **whitespace collapse** — tokenisation hygiene; stops stray double/trailing
-  spaces from inventing word errors.
-
-The raw `reference` and `prediction` columns are always saved untouched, so you can
-recompute under any scheme later without re-running inference.
+- **Seamless / OWSM** → real numbers on Hi/Ta/Ur/Bn; the tribal/scheduled four
+  are coverage gaps (auto-logged `unsupported`). Both are broad-multilingual
+  *foundation* models; OWSM is the open, reproducible one (ESPnet).
+- **IndicConformer** → all eight. Indic-*specialist*, so keep it in its own
+  group in the paper (upper bound), not lumped with the foundation models.
 
 ## Install
 
 ```bash
 pip install -r requirements.txt
-# IndicConformer is gated:
-huggingface-cli login        # after accepting the terms on its HF model page
+huggingface-cli login          # for the gated IndicConformer (after accepting terms)
 ```
+
+ESPnet (for OWSM) is a heavy install. If it fights the rest of the stack, install
+it last, or run OWSM in a separate session: `pip install espnet espnet_model_zoo librosa`.
 
 ## Run
 
 ```bash
-# IndicConformer — the only model that gives you a full 8-language column
+# IndicConformer — full 8-language column
 for L in hindi tamil urdu bengali dogri kashmiri santali bodo; do
-    python asr_eval.py --model indicconformer --lang $L \
-        --data /content/drive/MyDrive/test_$L --decoder ctc --out results
+    python asr_eval.py --model indicconformer --lang $L --out results
+done
+# Seamless + OWSM — real on the four majors, auto coverage-gap on the rest
+for M in seamless owsm; do
+  for L in hindi tamil urdu bengali; do
+      python asr_eval.py --model $M --lang $L --out results
+  done
+  for L in dogri kashmiri santali bodo; do
+      python asr_eval.py --model $M --lang $L --out results
+  done
 done
 
-# Seamless — real on the first four, auto coverage-gap on the rest
-for L in hindi tamil urdu bengali; do
-    python asr_eval.py --model seamless --lang $L --data /content/drive/MyDrive/test_$L --out results
-done
-for L in dogri kashmiri santali bodo; do
-    python asr_eval.py --model seamless --lang $L --out results   # logged unsupported, no GPU spent
-done
-
-# Moonshine — all eight are coverage gaps
-for L in hindi tamil urdu bengali dogri kashmiri santali bodo; do
-    python asr_eval.py --model moonshine --lang $L --out results
-done
-```
-
-`--data` takes either a local `load_from_disk` folder (your Drive copies) or a HF
-hub id (`XKaab/ASR-Hindi_7hrs`). Omit it to fall back to the sheet's hub id.
-
-Build the matrices:
-
-```bash
 python aggregate.py results/summary.csv --metric WER --out matrix_wer.csv
 python aggregate.py results/summary.csv --metric CER --out matrix_cer.csv
 ```
 
 ## Notes
 
-- `--decoder rnnt` is usually a touch more accurate than `ctc`, a touch slower.
-- If IndicConformer's custom forward throws a device error, run it on CPU
-  (600M is slow but fine for 2 h) — remove the GPU; the adapter already falls back.
-- Verify the logic with no GPU/network: `python asr_eval.py --selftest`.
-- WER is not clipped and can exceed 100% on coverage gaps — that's correct;
-  report those as coverage, not as a quality gradient.
-
-**On IndicConformer and the paper:** it's a purpose-built, supervised Indic model,
-not a web-scale foundation model like the others. It'll likely score *well* on all
-eight — which makes it a counterpoint to the "foundation models exclude tribal
-languages" thesis, not a test of it. Report it as a clearly-labelled
-Indic-specialized reference / upper bound in its own row, not mixed into the
-foundation-model group.
+- Defaults: `--split valid`, `--text-field normalized`. Switch refs with
+  `--text-field verbatim`; `--decoder rnnt` for a stronger IndicConformer number.
+- `--data` takes a local `load_from_disk` folder or a HF hub id; omit it to use
+  the sheet's hub id.
+- OWSM model tag is `OWSM_MODEL` at the top of `asr_eval.py`
+  (`espnet/owsm_ctc_v3.1_1B`; swap to `espnet/owsm_ctc_v4_1B` for the newer one).
+- Text is RAW (NFC + whitespace only); raw `reference`/`prediction` columns are
+  always saved so you can re-score under any scheme later.
+- WER isn't clipped and can exceed 100% on coverage gaps — that's correct.
+- Verify offline: `python asr_eval.py --selftest`.
