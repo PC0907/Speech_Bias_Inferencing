@@ -9,7 +9,7 @@ Unsupported cells are written as "n/a" so coverage gaps stay distinct from score
 """
 import argparse, csv, collections
 
-MODEL_ORDER = ["seamless", "moonshine", "indicconformer"]   # Ali's slice
+MODEL_ORDER = ["seamless", "owsm", "indicconformer"]   # Ali's slice
 LANG_ORDER  = ["hindi", "tamil", "urdu", "bengali",
                "dogri", "kashmiri", "santali", "bodo"]
 
