@@ -1,14 +1,19 @@
 torch>=2.1
-transformers>=4.49        # SeamlessM4Tv2 + Moonshine need a recent build
+transformers>=4.49        # SeamlessM4Tv2 needs a recent build
 datasets>=2.18
 torchaudio                # resampling to 16 kHz
 sentencepiece             # SeamlessM4T tokenizer
 
-# IndicConformer runs custom_code via trust_remote_code and pulls ONNX:
+# IndicConformer (custom_code via trust_remote_code) pulls ONNX:
 onnx==1.20.1
-onnxruntime-gpu==1.20.1   # use onnxruntime==1.20.1 instead if you have no GPU
+onnxruntime-gpu==1.20.1   # onnxruntime==1.20.1 if no GPU
+
+# OWSM-CTC runs through ESPnet (NOT transformers). Heavy install (~few min);
+# flash-attn is NOT needed for inference. Best installed on its own.
+espnet
+espnet_model_zoo
+librosa
+soundfile
 
 numpy
-
-# Note: WER/CER are built into asr_eval.py (no jiwer needed), so you can score
-# offline on an HPC node even without torch/transformers installed.
+# WER/CER are built into asr_eval.py (no jiwer needed) -> offline scoring works.
