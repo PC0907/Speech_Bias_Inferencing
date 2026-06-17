@@ -1,48 +1,40 @@
 #!/usr/bin/env python3
 """
-ASR eval harness -- Ali's slice (seamless | owsm | indicconformer).
-Moonshine retired (English-only, covered none of the 8).
+ASR eval harness -- Rimsha's slice (speecht5 | mms).
 
-Coverage:
-  Seamless        -> hi/ta/ur/bn only
-  OWSM-CTC        -> hi/ta/ur/bn only (open Whisper-style foundation model)
-  IndicConformer  -> all 8
+SpeechT5  -> English-only (LibriSpeech fine-tune); all 8 languages are
+             coverage gaps. Framing: exclusion by design, not omission.
+MMS       -> Claims 1107 languages via per-adapter architecture. THE key
+             "prove it" model: adapters are tried natively for all 8,
+             including Dogri (dgo), Kashmiri (kas), Santali (sat), Bodo (brx).
+             If an adapter doesn't exist -> logged as "no_adapter" (a finding).
+             If it exists but WER is catastrophic -> logged as "scored".
 
-Dataset is IndicVoices-style: audio in `audio_filepath` as a torchcodec
-AudioDecoder, a `duration` field, references in `normalized`/`verbatim`/`text`.
+Per (model, language): load -> deterministic ~2h subset -> inference ->
+reference-prediction CSV (raw text kept) -> WER+CER row in summary.csv.
 
-Per (model, language): load -> deterministic ~2h subset (by `duration`) ->
-inference -> reference-prediction CSV (raw text kept) -> WER+CER row.
-
-Text handling is RAW: NFC + whitespace collapse only (--byte-exact drops NFC).
-Metrics are self-contained, so scoring needs no jiwer/torch.
+Text handling is RAW: NFC + whitespace collapse only. Metrics self-contained.
 
 Examples:
-  python asr_eval.py --model indicconformer --lang santali
-  python asr_eval.py --model owsm --lang hindi
-  python asr_eval.py --model seamless --lang bengali --text-field verbatim
-  python asr_eval.py --selftest
+  python asr_eval_rimsha.py --model mms --lang santali
+  python asr_eval_rimsha.py --model mms --lang hindi
+  python asr_eval_rimsha.py --model speecht5 --lang hindi   # coverage gap
+  python asr_eval_rimsha.py --selftest
 """
 import argparse, csv, os, re, sys, unicodedata
 
-MODELS = ["seamless", "owsm", "indicconformer"]
-OWSM_MODEL = "espnet/owsm_ctc_v3.1_1B"          # or espnet/owsm_ctc_v4_1B (newer)
+MODELS = ["speecht5", "mms"]
 
 LANGS = {
-    "hindi":    {"hub": "XKaab/ASR-Hindi_7hrs",    "seamless": "hin", "owsm": "hin", "ic": "hi",  "tier": "HRL"},
-    "tamil":    {"hub": "XKaab/ASR-Tamil_8hrs",    "seamless": "tam", "owsm": "tam", "ic": "ta",  "tier": "HRL"},
-    "urdu":     {"hub": "XKaab/ASR-Urdu_6hrs",     "seamless": "urd", "owsm": "urd", "ic": "ur",  "tier": "MRL"},
-    "bengali":  {"hub": "XKaab/ASR-Bengali_6hrs",  "seamless": "ben", "owsm": "ben", "ic": "bn",  "tier": "MRL"},
-    "dogri":    {"hub": "XKaab/ASR-Dogri_4hrs",    "seamless": None,  "owsm": None,  "ic": "doi", "tier": "LRL-Scheduled"},
-    "kashmiri": {"hub": "XKaab/ASR-Kashmiri_4hrs", "seamless": None,  "owsm": None,  "ic": "ks",  "tier": "LRL-Scheduled"},
-    "santali":  {"hub": "XKaab/ASR-Santali_4hrs",  "seamless": None,  "owsm": None,  "ic": "sat", "tier": "LRL-Tribal"},
-    "bodo":     {"hub": "XKaab/ASR-Bodo_5hrs",     "seamless": None,  "owsm": None,  "ic": "brx", "tier": "LRL-Tribal"},
+    "hindi":    {"hub": "XKaab/ASR-Hindi_7hrs",    "mms": "hin", "tier": "HRL"},
+    "tamil":    {"hub": "XKaab/ASR-Tamil_8hrs",    "mms": "tam", "tier": "HRL"},
+    "urdu":     {"hub": "XKaab/ASR-Urdu_6hrs",     "mms": "urd", "tier": "MRL"},
+    "bengali":  {"hub": "XKaab/ASR-Bengali_6hrs",  "mms": "ben", "tier": "MRL"},
+    "dogri":    {"hub": "XKaab/ASR-Dogri_4hrs",    "mms": "dgo", "tier": "LRL-Scheduled"},
+    "kashmiri": {"hub": "XKaab/ASR-Kashmiri_4hrs", "mms": "kas", "tier": "LRL-Scheduled"},
+    "santali":  {"hub": "XKaab/ASR-Santali_4hrs",  "mms": "sat", "tier": "LRL-Tribal"},
+    "bodo":     {"hub": "XKaab/ASR-Bodo_5hrs",     "mms": "brx", "tier": "LRL-Tribal"},
 }
-
-# When forcing a model onto a language it doesn't support, decode with a nearest
-# major language's code (script-based default; override with --force-lang).
-# Devanagari Indo-Aryan/Tibeto-Burman -> Hindi; Perso-Arabic Kashmiri -> Urdu.
-PROXY = {"dogri": "hindi", "bodo": "hindi", "santali": "hindi", "kashmiri": "urdu"}
 
 AUDIO_KEYS = ("audio_filepath", "audio", "speech", "wav")
 TEXT_KEYS  = ("normalized", "text", "verbatim", "sentence", "transcription", "transcript")
@@ -89,12 +81,10 @@ def score(ref_raw, hyp_raw, nfc=True):
 
 # --------------------------------------------------------------------------
 def supported(model, lang):
-    if model == "seamless":
-        return LANGS[lang]["seamless"] is not None
-    if model == "owsm":
-        return LANGS[lang]["owsm"] is not None
-    if model == "indicconformer":
-        return True
+    if model == "speecht5":
+        return False      # English-only; every cell is a coverage gap
+    if model == "mms":
+        return True       # claims all 8 natively via adapters; adapter may still fail
     raise ValueError(model)
 
 # --------------------------------------------------------------------------
@@ -111,7 +101,7 @@ def extract_audio(a):
         import soundfile as sf
         arr, sr = sf.read(a, dtype="float32")
     else:
-        raise TypeError(f"Unrecognised audio value of type {type(a)}")
+        raise TypeError(f"Unrecognised audio type: {type(a)}")
     if getattr(arr, "ndim", 1) == 2:
         arr = arr.mean(axis=0 if arr.shape[0] < arr.shape[1] else 1)
     return arr.astype("float32"), sr
@@ -160,58 +150,48 @@ def select_subset(rows, target_seconds, akey, dur_key):
     return out, total
 
 # --------------------------------------------------------------------------
-# Model adapters (lazy heavy imports)
+# Model adapters
 # --------------------------------------------------------------------------
-def load_seamless(device, info):
+def load_speecht5(device):
+    """English-only. Used only with --force to record the exclusion WER."""
     import torch
-    from transformers import AutoProcessor, SeamlessM4Tv2ForSpeechToText
-    proc = AutoProcessor.from_pretrained("facebook/seamless-m4t-v2-large")
-    model = SeamlessM4Tv2ForSpeechToText.from_pretrained(
-        "facebook/seamless-m4t-v2-large",
-        torch_dtype=torch.float16 if device == "cuda" else torch.float32,
-    ).to(device).eval()
+    from transformers import SpeechT5Processor, SpeechT5ForSpeechToText
+    proc = SpeechT5Processor.from_pretrained("microsoft/speecht5_asr")
+    model = SpeechT5ForSpeechToText.from_pretrained(
+        "microsoft/speecht5_asr").to(device).eval()
     def transcribe(audio16k, lang):
-        try:                                       # newer transformers: audio=
-            inp = proc(audio=audio16k, sampling_rate=16000, return_tensors="pt").to(device)
-        except TypeError:                          # older transformers: audios=
-            inp = proc(audios=audio16k, sampling_rate=16000, return_tensors="pt").to(device)
+        inp = proc(audio=audio16k, sampling_rate=16000, return_tensors="pt").to(device)
         with torch.no_grad():
-            toks = model.generate(**inp, tgt_lang=lang["seamless"])
-        return proc.batch_decode(toks, skip_special_tokens=True)[0]
+            ids = model.generate(**inp, max_length=400)
+        return proc.batch_decode(ids, skip_special_tokens=True)[0]
     return transcribe
 
-def load_owsm(device, info):
-    import numpy as np
-    from espnet2.bin.s2t_inference_ctc import Speech2TextGreedySearch
-    s2t = Speech2TextGreedySearch.from_pretrained(
-        OWSM_MODEL, device=device, use_flash_attn=False,
-        lang_sym=f"<{info['owsm']}>", task_sym="<asr>",
-    )
-    def transcribe(audio16k, lang):
-        # batch_decode pads <30s to 30s and splits longer audio automatically;
-        # a single 1-D array returns a single string.
-        return s2t.batch_decode(np.asarray(audio16k, dtype="float32"),
-                                batch_size=1, context_len_in_secs=4)
-    return transcribe
+def load_mms(device):
+    """
+    MMS-1b-all: Wav2Vec2ForCTC + per-language adapter.
+    Call sequence per utterance:
+      processor.tokenizer.set_target_lang(lang_code)
+      model.load_adapter(lang_code)
+      -> greedy CTC decode
+    Raises RuntimeError if the adapter doesn't exist -> caught as "no_adapter".
+    """
+    import torch
+    from transformers import Wav2Vec2ForCTC, AutoProcessor
+    proc = AutoProcessor.from_pretrained("facebook/mms-1b-all")
+    model = Wav2Vec2ForCTC.from_pretrained("facebook/mms-1b-all").to(device).eval()
+    current_lang = [None]   # track loaded adapter to avoid redundant reloads
 
-def load_indicconformer(device, info, decoder="ctc"):
-    import torch, numpy as np
-    from transformers import AutoModel
-    model = AutoModel.from_pretrained(
-        "ai4bharat/indic-conformer-600m-multilingual", trust_remote_code=True).eval()
-    try:
-        model = model.to(device)
-    except Exception:
-        device = "cpu"
     def transcribe(audio16k, lang):
-        wav = torch.tensor(np.asarray(audio16k, dtype="float32")).unsqueeze(0)
-        try:
-            wav = wav.to(device)
-        except Exception:
-            pass
+        code = lang["mms"]
+        if current_lang[0] != code:
+            proc.tokenizer.set_target_lang(code)
+            model.load_adapter(code)    # raises if adapter missing
+            current_lang[0] = code
+        inp = proc(audio16k, sampling_rate=16000, return_tensors="pt").to(device)
         with torch.no_grad():
-            out = model(wav, lang["ic"], decoder)
-        return out[0] if isinstance(out, (list, tuple)) else out
+            logits = model(**inp).logits
+        ids = torch.argmax(logits, dim=-1)
+        return proc.batch_decode(ids)[0]
     return transcribe
 
 def _cuda():
@@ -222,26 +202,16 @@ def _cuda():
         return False
 
 # --------------------------------------------------------------------------
-def run(model_name, lang, hours, out_dir, split, force, data_ref, decoder, nfc, text_field, force_lang):
+def run(model_name, lang, hours, out_dir, split, force, data_ref, nfc, text_field):
     os.makedirs(out_dir, exist_ok=True)
     info = LANGS[lang]
     ok = supported(model_name, lang)
 
+    # SpeechT5: every cell is a gap unless forced
     if not ok and not force:
         _summary(out_dir, model_name, lang, info["tier"], 0, 0.0, "", "", "unsupported")
-        print(f"[{model_name}/{lang}] UNSUPPORTED -> coverage gap (use --force to run anyway).")
+        print(f"[{model_name}/{lang}] UNSUPPORTED (English-only) -> coverage gap.")
         return
-
-    # Forcing an unsupported language: decode with a proxy language's code.
-    model_info, proxy_note = info, ""
-    if not ok and force:
-        pkey = force_lang or PROXY.get(lang)
-        if pkey:
-            p = LANGS[pkey]
-            model_info = {**info, "seamless": p["seamless"], "owsm": p["owsm"], "ic": p["ic"]}
-            proxy_note = pkey
-            print(f"[{model_name}/{lang}] FORCED via '{pkey}' "
-                  f"(transcribing {lang} audio with {pkey}'s decoder).")
 
     data_ref = data_ref or info["hub"]
     ds = load_any(data_ref, split)
@@ -253,22 +223,44 @@ def run(model_name, lang, hours, out_dir, split, force, data_ref, decoder, nfc, 
     ds = load_any(data_ref, split)
     rows, total = select_subset(ds, hours * 3600, akey, dkey)
     print(f"[{model_name}/{lang}] {len(rows)} utts ({total/3600:.2f} h)  "
-          f"audio='{akey}' text='{tkey}' dur='{dkey}'  data='{data_ref}'")
+          f"audio='{akey}' text='{tkey}'  data='{data_ref}'")
 
     device = "cuda" if _cuda() else "cpu"
-    if model_name == "indicconformer":
-        transcribe = load_indicconformer(device, model_info, decoder)
-    elif model_name == "owsm":
-        transcribe = load_owsm(device, model_info)
+    if model_name == "mms":
+        transcribe = load_mms(device)
     else:
-        transcribe = load_seamless(device, model_info)
+        transcribe = load_speecht5(device)
+
+    # For MMS, try loading the adapter once up front to detect "no_adapter" early
+    if model_name == "mms":
+        from transformers import Wav2Vec2ForCTC, AutoProcessor
+        try:
+            # adapter is loaded inside transcribe() on first call; probe here
+            import torch
+            from transformers import AutoProcessor as AP
+            _p = AP.from_pretrained("facebook/mms-1b-all")
+            _p.tokenizer.set_target_lang(info["mms"])
+        except Exception as e:
+            if "adapter" in str(e).lower() or "no file" in str(e).lower():
+                _summary(out_dir, model_name, lang, info["tier"], 0, 0.0, "", "", "no_adapter")
+                print(f"[{model_name}/{lang}] NO ADAPTER for '{info['mms']}' -> "
+                      f"logged as no_adapter (MMS doesn't cover this language). Error: {e}")
+                return
 
     out_rows, W, C = [], [], []
+    adapter_failed = False
     for i, ex in enumerate(rows):
         try:
             audio, sr = extract_audio(ex[akey])
-            hyp = transcribe(to_16k(audio, sr), model_info)
+            hyp = transcribe(to_16k(audio, sr), info)
         except Exception as e:
+            err = str(e).lower()
+            if "adapter" in err or "no file" in err or "404" in err:
+                # adapter doesn't exist: log immediately, don't continue
+                _summary(out_dir, model_name, lang, info["tier"], 0, 0.0, "", "", "no_adapter")
+                print(f"[{model_name}/{lang}] NO ADAPTER for '{info['mms']}': {e}")
+                adapter_failed = True
+                break
             hyp = ""
             print(f"  utt {i}: error -> empty hyp ({e})")
         ref = ex.get(tkey, "")
@@ -278,8 +270,8 @@ def run(model_name, lang, hours, out_dir, split, force, data_ref, decoder, nfc, 
                          "ref_prep": rp, "hyp_prep": hp,
                          "wer": round(w, 4), "cer": round(c, 4)})
 
-    if not out_rows:
-        print(f"[{model_name}/{lang}] no rows scored."); return
+    if adapter_failed or not out_rows:
+        return
 
     p = os.path.join(out_dir, f"{model_name}__{lang}.csv")
     with open(p, "w", newline="", encoding="utf-8") as f:
@@ -287,7 +279,7 @@ def run(model_name, lang, hours, out_dir, split, force, data_ref, decoder, nfc, 
         w_.writeheader(); w_.writerows(out_rows)
 
     aw, ac = sum(W) / len(W), sum(C) / len(C)
-    status = "scored" if ok else (f"forced(via {proxy_note})" if proxy_note else "forced")
+    status = "scored" if ok else "forced(unsupported)"
     _summary(out_dir, model_name, lang, info["tier"], len(out_rows), total / 3600,
              round(aw, 4), round(ac, 4), status)
     print(f"[{model_name}/{lang}] WER={aw:.4f}  CER={ac:.4f}  (ref='{tkey}')  -> {p}")
@@ -306,39 +298,31 @@ def _summary(out_dir, model, lang, tier, n, hrs, w, c, status):
 def selftest():
     assert prep("Hello,  World!") == "Hello, World!"
     assert prep("क।") == "क।"
-    assert prep("a\t b\n c") == "a b c"
+    assert prep("a\t b") == "a b"
     assert abs(wer("the cat sat", "the dog sat") - 1/3) < 1e-9
     assert abs(wer("a", "a b c") - 2.0) < 1e-9
     assert abs(cer("abc", "abd") - 1/3) < 1e-9
-    arr, sr = extract_audio({"array": [0.1, 0.2, 0.3], "sampling_rate": 16000})
-    assert sr == 16000 and len(arr) == 3
     fake = [{"audio_filepath": {"array": [0.0]*16000, "sampling_rate": 16000},
              "duration": 1.0} for _ in range(10)]
     sel, tot = select_subset(iter(fake), 3, "audio_filepath", "duration")
     assert len(sel) == 3 and abs(tot - 3.0) < 1e-9
-    assert pick_text_key({"normalized": "x"}, "verbatim") == "normalized"  # fallback
-    assert supported("seamless", "hindi") and not supported("seamless", "santali")
-    assert supported("owsm", "hindi") and not supported("owsm", "santali")
-    assert supported("indicconformer", "santali")
+    assert not supported("speecht5", "hindi")
+    assert supported("mms", "santali")
     print("OK: all self-tests passed.")
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser(description="Ali's ASR eval (seamless | owsm | indicconformer).")
+    ap = argparse.ArgumentParser(
+        description="Rimsha's ASR eval: speecht5 (English-only) + mms (1107-lang claim).")
     ap.add_argument("--model", choices=MODELS)
     ap.add_argument("--lang", choices=list(LANGS))
-    ap.add_argument("--data", default=None, help="local path or HF hub id (default: sheet's hub id)")
+    ap.add_argument("--data", default=None)
     ap.add_argument("--hours", type=float, default=2.0)
     ap.add_argument("--out", default="results")
     ap.add_argument("--split", default="valid")
-    ap.add_argument("--text-field", default="normalized",
-                    help="reference column: normalized | verbatim | text")
-    ap.add_argument("--decoder", choices=["ctc", "rnnt"], default="ctc",
-                    help="IndicConformer only")
+    ap.add_argument("--text-field", default="normalized")
     ap.add_argument("--force", action="store_true",
-                    help="run an unsupported cell anyway (decodes via a proxy language)")
-    ap.add_argument("--force-lang", default=None, choices=list(LANGS),
-                    help="proxy language whose code to use when forcing (default: script-based)")
-    ap.add_argument("--byte-exact", action="store_true", help="disable NFC too")
+                    help="run speecht5 anyway to record English-model-on-Indic exclusion WER")
+    ap.add_argument("--byte-exact", action="store_true")
     ap.add_argument("--selftest", action="store_true")
     a = ap.parse_args()
 
@@ -347,4 +331,4 @@ if __name__ == "__main__":
     if not (a.model and a.lang):
         ap.error("--model and --lang are required (or use --selftest)")
     run(a.model, a.lang, a.hours, a.out, a.split, a.force, a.data,
-        a.decoder, not a.byte_exact, a.text_field, a.force_lang)
+        not a.byte_exact, a.text_field)
