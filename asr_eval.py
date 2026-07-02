@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
-ASR eval harness -- Rimsha's slice (speecht5 | mms).
+ASR eval harness -- speecht5 | mms | indicconformer.
 
-SpeechT5  -> English-only (LibriSpeech fine-tune); all 8 languages are
-             coverage gaps. Framing: exclusion by design, not omission.
-MMS       -> Claims 1107 languages via per-adapter architecture. THE key
-             "prove it" model: adapters are tried natively for all 8,
-             including Dogri (dgo), Kashmiri (kas), Santali (sat), Bodo (brx).
-             If an adapter doesn't exist -> logged as "no_adapter" (a finding).
-             If it exists but WER is catastrophic -> logged as "scored".
+SpeechT5       -> English-only (LibriSpeech fine-tune); all 8 languages are
+                  coverage gaps. Framing: exclusion by design, not omission.
+MMS            -> Claims 1107 languages via per-adapter architecture. Adapters
+                  are tried natively for all 8; missing adapter -> "no_adapter".
+IndicConformer -> AI4Bharat 600M multilingual; natively covers all 22 IN-22
+                  scheduled languages, incl. the tribal LRLs (Santali, Bodo)
+                  and scheduled LRLs (Dogri, Kashmiri). Loaded via HF AutoModel
+                  (trust_remote_code) -- inference only, no NeMo needed.
 
 Per (model, language): load -> deterministic ~2h subset -> inference ->
 reference-prediction CSV (raw text kept) -> WER+CER row in summary.csv.
@@ -16,24 +17,25 @@ reference-prediction CSV (raw text kept) -> WER+CER row in summary.csv.
 Text handling is RAW: NFC + whitespace collapse only. Metrics self-contained.
 
 Examples:
-  python asr_eval_rimsha.py --model mms --lang santali
-  python asr_eval_rimsha.py --model mms --lang hindi
-  python asr_eval_rimsha.py --model speecht5 --lang hindi   # coverage gap
-  python asr_eval_rimsha.py --selftest
+  python asr_eval.py --model indicconformer --lang santali
+  python asr_eval.py --model indicconformer --lang hindi --decode rnnt
+  python asr_eval.py --model mms --lang santali
+  python asr_eval.py --model speecht5 --lang hindi   # coverage gap
+  python asr_eval.py --selftest
 """
 import argparse, csv, os, re, sys, unicodedata
 
-MODELS = ["speecht5", "mms"]
+MODELS = ["speecht5", "mms", "indicconformer"]
 
 LANGS = {
-    "hindi":    {"hub": "XKaab/ASR-Hindi_7hrs",    "mms": "hin", "tier": "HRL"},
-    "tamil":    {"hub": "XKaab/ASR-Tamil_8hrs",    "mms": "tam", "tier": "HRL"},
-    "urdu":     {"hub": "XKaab/ASR-Urdu_6hrs",     "mms": "urd", "tier": "MRL"},
-    "bengali":  {"hub": "XKaab/ASR-Bengali_6hrs",  "mms": "ben", "tier": "MRL"},
-    "dogri":    {"hub": "XKaab/ASR-Dogri_4hrs",    "mms": "dgo", "tier": "LRL-Scheduled"},
-    "kashmiri": {"hub": "XKaab/ASR-Kashmiri_4hrs", "mms": "kas", "tier": "LRL-Scheduled"},
-    "santali":  {"hub": "XKaab/ASR-Santali_4hrs",  "mms": "sat", "tier": "LRL-Tribal"},
-    "bodo":     {"hub": "XKaab/ASR-Bodo_5hrs",     "mms": "brx", "tier": "LRL-Tribal"},
+    "hindi":    {"hub": "XKaab/ASR-Hindi_7hrs",    "mms": "hin", "ic": "hi",  "tier": "HRL"},
+    "tamil":    {"hub": "XKaab/ASR-Tamil_8hrs",    "mms": "tam", "ic": "ta",  "tier": "HRL"},
+    "urdu":     {"hub": "XKaab/ASR-Urdu_6hrs",     "mms": "urd", "ic": "ur",  "tier": "MRL"},
+    "bengali":  {"hub": "XKaab/ASR-Bengali_6hrs",  "mms": "ben", "ic": "bn",  "tier": "MRL"},
+    "dogri":    {"hub": "XKaab/ASR-Dogri_4hrs",    "mms": "dgo", "ic": "doi", "tier": "LRL-Scheduled"},
+    "kashmiri": {"hub": "XKaab/ASR-Kashmiri_4hrs", "mms": "kas", "ic": "ks",  "tier": "LRL-Scheduled"},
+    "santali":  {"hub": "XKaab/ASR-Santali_4hrs",  "mms": "sat", "ic": "sat", "tier": "LRL-Tribal"},
+    "bodo":     {"hub": "XKaab/ASR-Bodo_5hrs",     "mms": "brx", "ic": "brx", "tier": "LRL-Tribal"},
 }
 
 AUDIO_KEYS = ("audio_filepath", "audio", "speech", "wav")
@@ -85,6 +87,8 @@ def supported(model, lang):
         return False      # English-only; every cell is a coverage gap
     if model == "mms":
         return True       # claims all 8 natively via adapters; adapter may still fail
+    if model == "indicconformer":
+        return True       # all 8 are IN-22 scheduled langs -> native coverage
     raise ValueError(model)
 
 # --------------------------------------------------------------------------
@@ -194,6 +198,32 @@ def load_mms(device):
         return proc.batch_decode(ids)[0]
     return transcribe
 
+def load_indicconformer(device, decode="ctc"):
+    """
+    AI4Bharat IndicConformer-600M-Multi: single Hybrid CTC+RNNT conformer that
+    natively covers all 22 IN-22 scheduled languages. One model; language is
+    selected per call -- no per-language reload. Inference only (no NeMo).
+
+    Forward:  model(wav, lang_code, "ctc"|"rnnt") -> transcription (str)
+    wav: float32 tensor [1, num_samples] @ 16 kHz.
+    """
+    import torch
+    from transformers import AutoModel
+    model = AutoModel.from_pretrained(
+        "ai4bharat/indic-conformer-600m-multilingual",
+        trust_remote_code=True,
+    ).to(device).eval()
+
+    def transcribe(audio16k, lang):
+        code = lang["ic"]
+        wav = torch.tensor(audio16k, dtype=torch.float32).unsqueeze(0).to(device)  # [1, N]
+        with torch.no_grad():
+            out = model(wav, code, decode)
+        if isinstance(out, (list, tuple)):      # custom code returns str or [str]
+            out = out[0] if out else ""
+        return str(out)
+    return transcribe
+
 def _cuda():
     try:
         import torch
@@ -202,7 +232,8 @@ def _cuda():
         return False
 
 # --------------------------------------------------------------------------
-def run(model_name, lang, hours, out_dir, split, force, data_ref, nfc, text_field):
+def run(model_name, lang, hours, out_dir, split, force, data_ref, nfc, text_field,
+        decode="ctc", transcribe=None):
     os.makedirs(out_dir, exist_ok=True)
     info = LANGS[lang]
     ok = supported(model_name, lang)
@@ -225,18 +256,19 @@ def run(model_name, lang, hours, out_dir, split, force, data_ref, nfc, text_fiel
     print(f"[{model_name}/{lang}] {len(rows)} utts ({total/3600:.2f} h)  "
           f"audio='{akey}' text='{tkey}'  data='{data_ref}'")
 
-    device = "cuda" if _cuda() else "cpu"
-    if model_name == "mms":
-        transcribe = load_mms(device)
-    else:
-        transcribe = load_speecht5(device)
+    # Load the model once (or reuse a preloaded one passed in via transcribe=)
+    if transcribe is None:
+        device = "cuda" if _cuda() else "cpu"
+        if model_name == "mms":
+            transcribe = load_mms(device)
+        elif model_name == "indicconformer":
+            transcribe = load_indicconformer(device, decode)
+        else:
+            transcribe = load_speecht5(device)
 
     # For MMS, try loading the adapter once up front to detect "no_adapter" early
     if model_name == "mms":
-        from transformers import Wav2Vec2ForCTC, AutoProcessor
         try:
-            # adapter is loaded inside transcribe() on first call; probe here
-            import torch
             from transformers import AutoProcessor as AP
             _p = AP.from_pretrained("facebook/mms-1b-all")
             _p.tokenizer.set_target_lang(info["mms"])
@@ -280,6 +312,8 @@ def run(model_name, lang, hours, out_dir, split, force, data_ref, nfc, text_fiel
 
     aw, ac = sum(W) / len(W), sum(C) / len(C)
     status = "scored" if ok else "forced(unsupported)"
+    if model_name == "indicconformer":
+        status = f"{status}[{decode}]"
     _summary(out_dir, model_name, lang, info["tier"], len(out_rows), total / 3600,
              round(aw, 4), round(ac, 4), status)
     print(f"[{model_name}/{lang}] WER={aw:.4f}  CER={ac:.4f}  (ref='{tkey}')  -> {p}")
@@ -308,18 +342,23 @@ def selftest():
     assert len(sel) == 3 and abs(tot - 3.0) < 1e-9
     assert not supported("speecht5", "hindi")
     assert supported("mms", "santali")
+    assert supported("indicconformer", "santali")
+    assert supported("indicconformer", "bodo")
+    assert LANGS["bodo"]["ic"] == "brx" and LANGS["dogri"]["ic"] == "doi"
     print("OK: all self-tests passed.")
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
-        description="Rimsha's ASR eval: speecht5 (English-only) + mms (1107-lang claim).")
+        description="ASR eval: speecht5 (English-only) + mms + indicconformer.")
     ap.add_argument("--model", choices=MODELS)
-    ap.add_argument("--lang", choices=list(LANGS))
+    ap.add_argument("--lang", choices=list(LANGS) + ["all"])
     ap.add_argument("--data", default=None)
     ap.add_argument("--hours", type=float, default=2.0)
     ap.add_argument("--out", default="results")
     ap.add_argument("--split", default="valid")
     ap.add_argument("--text-field", default="normalized")
+    ap.add_argument("--decode", choices=["ctc", "rnnt"], default="ctc",
+                    help="IndicConformer decoding strategy (ignored by other models)")
     ap.add_argument("--force", action="store_true",
                     help="run speecht5 anyway to record English-model-on-Indic exclusion WER")
     ap.add_argument("--byte-exact", action="store_true")
@@ -330,5 +369,14 @@ if __name__ == "__main__":
         selftest(); sys.exit(0)
     if not (a.model and a.lang):
         ap.error("--model and --lang are required (or use --selftest)")
-    run(a.model, a.lang, a.hours, a.out, a.split, a.force, a.data,
-        not a.byte_exact, a.text_field)
+
+    langs = list(LANGS) if a.lang == "all" else [a.lang]
+
+    # Load a multilingual model once and reuse it across all languages
+    shared = None
+    if a.lang == "all" and a.model == "indicconformer":
+        shared = load_indicconformer("cuda" if _cuda() else "cpu", a.decode)
+
+    for lg in langs:
+        run(a.model, lg, a.hours, a.out, a.split, a.force, a.data,
+            not a.byte_exact, a.text_field, a.decode, transcribe=shared)
