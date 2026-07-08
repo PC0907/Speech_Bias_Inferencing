@@ -42,6 +42,14 @@ AUDIO_KEYS = ("audio_filepath", "audio", "speech", "wav")
 TEXT_KEYS  = ("normalized", "text", "verbatim", "sentence", "transcription", "transcript")
 DUR_KEYS   = ("duration", "length", "secs")
 
+# MMS signals a missing language adapter with a few different wordings; the
+# tokenizer/adapter error dumps the entire ~1100-code list, so we must catch
+# it *before* the per-utterance loop or it floods the notebook 1000+ times.
+_NO_ADAPTER_SIGNS = ("adapter", "no file", "404", "does not exist", "choose one of")
+def _is_missing_adapter(e):
+    s = str(e).lower()
+    return any(k in s for k in _NO_ADAPTER_SIGNS)
+
 # --------------------------------------------------------------------------
 # Text prep -- RAW (NFC + whitespace only)
 # --------------------------------------------------------------------------
@@ -273,10 +281,10 @@ def run(model_name, lang, hours, out_dir, split, force, data_ref, nfc, text_fiel
             _p = AP.from_pretrained("facebook/mms-1b-all")
             _p.tokenizer.set_target_lang(info["mms"])
         except Exception as e:
-            if "adapter" in str(e).lower() or "no file" in str(e).lower():
+            if _is_missing_adapter(e):
                 _summary(out_dir, model_name, lang, info["tier"], 0, 0.0, "", "", "no_adapter")
                 print(f"[{model_name}/{lang}] NO ADAPTER for '{info['mms']}' -> "
-                      f"logged as no_adapter (MMS doesn't cover this language). Error: {e}")
+                      f"logged as no_adapter (MMS doesn't cover this language).")
                 return
 
     out_rows, W, C = [], [], []
@@ -286,15 +294,14 @@ def run(model_name, lang, hours, out_dir, split, force, data_ref, nfc, text_fiel
             audio, sr = extract_audio(ex[akey])
             hyp = transcribe(to_16k(audio, sr), info)
         except Exception as e:
-            err = str(e).lower()
-            if "adapter" in err or "no file" in err or "404" in err:
+            if _is_missing_adapter(e):
                 # adapter doesn't exist: log immediately, don't continue
                 _summary(out_dir, model_name, lang, info["tier"], 0, 0.0, "", "", "no_adapter")
-                print(f"[{model_name}/{lang}] NO ADAPTER for '{info['mms']}': {e}")
+                print(f"[{model_name}/{lang}] NO ADAPTER for '{info['mms']}' -> no_adapter.")
                 adapter_failed = True
                 break
             hyp = ""
-            print(f"  utt {i}: error -> empty hyp ({e})")
+            print(f"  utt {i}: error -> empty hyp ({str(e)[:200]})")   # truncated
         ref = ex.get(tkey, "")
         w, c, rp, hp = score(ref, hyp, nfc)
         W.append(w); C.append(c)
