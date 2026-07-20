@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-ASR eval harness -- speecht5 | mms | indicconformer.
+ASR eval harness -- speecht5 | mms | indicconformer | owsm.
 
 SpeechT5       -> English-only (LibriSpeech fine-tune); all 8 languages are
                   coverage gaps. Framing: exclusion by design, not omission.
@@ -10,32 +10,54 @@ IndicConformer -> AI4Bharat 600M multilingual; natively covers all 22 IN-22
                   scheduled languages, incl. the tribal LRLs (Santali, Bodo)
                   and scheduled LRLs (Dogri, Kashmiri). Loaded via HF AutoModel
                   (trust_remote_code) -- inference only, no NeMo needed.
+OWSM           -> CMU/ESPnet Open Whisper-style model. NOT a transformers
+                  model: loads via espnet2.bin.s2t_inference.Speech2Text.
+                  Coverage is read off the checkpoint's own token list at load
+                  time -- a language with no "<xxx>" token is logged as
+                  "unsupported_lang", not scored as a bad WER.
 
 Per (model, language): load -> deterministic ~2h subset -> inference ->
 reference-prediction CSV (raw text kept) -> WER+CER row in summary.csv.
 
 Text handling is RAW: NFC + whitespace collapse only. Metrics self-contained.
 
+Kaggle setup for OWSM (needs internet ON; ESPnet pins older deps, so run OWSM
+in a fresh session, not the same one as IndicConformer):
+  !pip install -q espnet espnet_model_zoo librosa
+  !python asr.py --model owsm --lang hindi --out /kaggle/working/results
+
 Examples:
-  python asr_eval.py --model indicconformer --lang santali
-  python asr_eval.py --model indicconformer --lang hindi --decode rnnt
-  python asr_eval.py --model mms --lang santali
-  python asr_eval.py --model speecht5 --lang hindi   # coverage gap
-  python asr_eval.py --selftest
+  python asr.py --model indicconformer --lang santali
+  python asr.py --model indicconformer --lang hindi --decode rnnt
+  python asr.py --model mms --lang santali
+  python asr.py --model owsm --lang hindi
+  python asr.py --model owsm --lang all --owsm-model espnet/owsm_ctc_v4_1B
+  python asr.py --model speecht5 --lang hindi   # coverage gap
+  python asr.py --selftest
 """
 import argparse, csv, os, re, sys, unicodedata
 
-MODELS = ["speecht5", "mms", "indicconformer"]
+MODELS = ["speecht5", "mms", "indicconformer", "owsm"]
 
+# --- OWSM --- checkpoints selectable via --owsm-model
+OWSM_CHECKPOINTS = [
+    "espnet/owsm_v4_medium_1B",   # AED, 1B, 320k h  (default)
+    "espnet/owsm_ctc_v4_1B",      # CTC, 1B, 320k h
+    "espnet/owsm_v3.1_ebf",       # AED, 1B, 180k h
+    "espnet/owsm_ctc_v3.1_1B",    # CTC, 1B, 180k h
+]
+
+# NOTE on the "owsm" codes: OWSM uses ISO-639-3. This deliberately does NOT
+# reuse the "mms" field -- MMS spells Dogri "dgo", ISO-639-3 is "doi".
 LANGS = {
-    "hindi":    {"hub": "XKaab/ASR-Hindi_7hrs",    "mms": "hin", "ic": "hi",  "tier": "HRL"},
-    "tamil":    {"hub": "XKaab/ASR-Tamil_8hrs",    "mms": "tam", "ic": "ta",  "tier": "HRL"},
-    "urdu":     {"hub": "XKaab/ASR-Urdu_6hrs",     "mms": "urd", "ic": "ur",  "tier": "MRL"},
-    "bengali":  {"hub": "XKaab/ASR-Bengali_6hrs",  "mms": "ben", "ic": "bn",  "tier": "MRL"},
-    "dogri":    {"hub": "XKaab/ASR-Dogri_4hrs",    "mms": "dgo", "ic": "doi", "tier": "LRL-Scheduled"},
-    "kashmiri": {"hub": "XKaab/ASR-Kashmiri_4hrs", "mms": "kas", "ic": "ks",  "tier": "LRL-Scheduled"},
-    "santali":  {"hub": "XKaab/ASR-Santali_4hrs",  "mms": "sat", "ic": "sat", "tier": "LRL-Tribal"},
-    "bodo":     {"hub": "XKaab/ASR-Bodo_5hrs",     "mms": "brx", "ic": "brx", "tier": "LRL-Tribal"},
+    "hindi":    {"hub": "XKaab/ASR-Hindi_7hrs",    "mms": "hin", "ic": "hi",  "owsm": "hin", "tier": "HRL"},
+    "tamil":    {"hub": "XKaab/ASR-Tamil_8hrs",    "mms": "tam", "ic": "ta",  "owsm": "tam", "tier": "HRL"},
+    "urdu":     {"hub": "XKaab/ASR-Urdu_6hrs",     "mms": "urd", "ic": "ur",  "owsm": "urd", "tier": "MRL"},
+    "bengali":  {"hub": "XKaab/ASR-Bengali_6hrs",  "mms": "ben", "ic": "bn",  "owsm": "ben", "tier": "MRL"},
+    "dogri":    {"hub": "XKaab/ASR-Dogri_4hrs",    "mms": "dgo", "ic": "doi", "owsm": "doi", "tier": "LRL-Scheduled"},
+    "kashmiri": {"hub": "XKaab/ASR-Kashmiri_4hrs", "mms": "kas", "ic": "ks",  "owsm": "kas", "tier": "LRL-Scheduled"},
+    "santali":  {"hub": "XKaab/ASR-Santali_4hrs",  "mms": "sat", "ic": "sat", "owsm": "sat", "tier": "LRL-Tribal"},
+    "bodo":     {"hub": "XKaab/ASR-Bodo_5hrs",     "mms": "brx", "ic": "brx", "owsm": "brx", "tier": "LRL-Tribal"},
 }
 
 AUDIO_KEYS = ("audio_filepath", "audio", "speech", "wav")
@@ -97,6 +119,8 @@ def supported(model, lang):
         return True       # claims all 8 natively via adapters; adapter may still fail
     if model == "indicconformer":
         return True       # all 8 are IN-22 scheduled langs -> native coverage
+    if model == "owsm":
+        return True       # provisional -- real coverage read from token list at load
     raise ValueError(model)
 
 # --------------------------------------------------------------------------
@@ -232,6 +256,93 @@ def load_indicconformer(device, decode="ctc"):
         return str(out)
     return transcribe
 
+# --- OWSM -----------------------------------------------------------------
+OWSM_WINDOW = 30 * 16000        # OWSM is trained on fixed 30 s inputs
+
+def _owsm_windows(x):
+    """Split into 30 s chunks, right-padding the last one.
+
+    Naive non-overlapping chunking. The OWSM model card uses an overlapped
+    buffered decode for long-form audio, which handles boundary words better.
+    Most utterance-level clips are well under 30 s so this rarely triggers,
+    but long recordings will take a small WER hit at the seams.
+    """
+    import numpy as np
+    x = np.asarray(x, dtype="float32")
+    if len(x) <= OWSM_WINDOW:
+        return [np.pad(x, (0, OWSM_WINDOW - len(x)))]
+    out = []
+    for i in range(0, len(x), OWSM_WINDOW):
+        chunk = x[i:i + OWSM_WINDOW]
+        out.append(np.pad(chunk, (0, max(0, OWSM_WINDOW - len(chunk)))))
+    return out
+
+def _owsm_text(result):
+    """ESPnet returns [(text, tokens, token_ints, text_nospecial, hyp), ...].
+
+    Field order has shifted between ESPnet releases, so prefer the
+    special-token-stripped field but fall back rather than hard-indexing.
+    """
+    if not result:
+        return ""
+    first = result[0]
+    cands = []
+    if len(first) >= 4:
+        cands.append(first[3])
+    if len(first) >= 2:
+        cands.append(first[-2])
+    cands.append(first[0])
+    for c in cands:
+        if isinstance(c, str) and c.strip():
+            return c
+    return ""
+
+def load_owsm(device, model_id="espnet/owsm_v4_medium_1B", beam_size=5):
+    """
+    OWSM via ESPnet. Two things differ from the transformers models above:
+
+    1. The language token is baked in at Speech2Text construction time, so we
+       build (and cache) one instance per language. Weights come from the local
+       cache after the first build, so the cost is init not download -- but
+       still ~20-40 s per new language.
+    2. Coverage is checked against the checkpoint's own token list. No
+       hardcoded supported-language list.
+
+    CTC checkpoints (owsm_ctc_*) use a different inference class; handled below.
+    """
+    is_ctc = "ctc" in model_id
+    if is_ctc:
+        from espnet2.bin.s2t_inference_ctc import Speech2TextGreedySearch as S2T
+        kw = {}
+    else:
+        from espnet2.bin.s2t_inference import Speech2Text as S2T
+        kw = {"beam_size": beam_size}
+
+    cache = {}
+    probe = S2T.from_pretrained(model_id, lang_sym="<eng>", task_sym="<asr>",
+                                device=device, **kw)
+    token_list = set(getattr(probe.converter, "token_list", []))
+    cache["eng"] = probe
+
+    def _for(code):
+        if code in cache:
+            return cache[code]
+        cache[code] = S2T.from_pretrained(model_id, lang_sym=f"<{code}>",
+                                          task_sym="<asr>", device=device, **kw)
+        return cache[code]
+
+    def transcribe(audio16k, lang):
+        s2t = _for(lang["owsm"])
+        return " ".join(_owsm_text(s2t(w)) for w in _owsm_windows(audio16k)).strip()
+
+    transcribe.covers = lambda code: f"<{code}>" in token_list
+    transcribe.model_id = model_id
+    transcribe.n_langs = sum(
+        1 for t in token_list
+        if isinstance(t, str) and len(t) == 5 and t.startswith("<") and t.endswith(">"))
+    return transcribe
+# --- end OWSM -------------------------------------------------------------
+
 def _cuda():
     try:
         import torch
@@ -241,7 +352,7 @@ def _cuda():
 
 # --------------------------------------------------------------------------
 def run(model_name, lang, hours, out_dir, split, force, data_ref, nfc, text_field,
-        decode="ctc", transcribe=None):
+        decode="ctc", transcribe=None, owsm_model="espnet/owsm_v4_medium_1B"):
     os.makedirs(out_dir, exist_ok=True)
     info = LANGS[lang]
     ok = supported(model_name, lang)
@@ -271,6 +382,8 @@ def run(model_name, lang, hours, out_dir, split, force, data_ref, nfc, text_fiel
             transcribe = load_mms(device)
         elif model_name == "indicconformer":
             transcribe = load_indicconformer(device, decode)
+        elif model_name == "owsm":                      # --- OWSM ---
+            transcribe = load_owsm(device, owsm_model)
         else:
             transcribe = load_speecht5(device)
 
@@ -286,6 +399,17 @@ def run(model_name, lang, hours, out_dir, split, force, data_ref, nfc, text_fiel
                 print(f"[{model_name}/{lang}] NO ADAPTER for '{info['mms']}' -> "
                       f"logged as no_adapter (MMS doesn't cover this language).")
                 return
+
+    # --- OWSM --- coverage gap check, mirrors the MMS block above
+    if model_name == "owsm" and hasattr(transcribe, "covers"):
+        code = info["owsm"]
+        if not transcribe.covers(code):
+            _summary(out_dir, model_name, lang, info["tier"], 0, 0.0, "", "",
+                     "unsupported_lang")
+            print(f"[{model_name}/{lang}] '<{code}>' NOT in token list of "
+                  f"{transcribe.model_id} ({transcribe.n_langs} lang tokens) -> "
+                  f"coverage gap, not scored.")
+            return
 
     out_rows, W, C = [], [], []
     adapter_failed = False
@@ -321,6 +445,8 @@ def run(model_name, lang, hours, out_dir, split, force, data_ref, nfc, text_fiel
     status = "scored" if ok else "forced(unsupported)"
     if model_name == "indicconformer":
         status = f"{status}[{decode}]"
+    if model_name == "owsm":                            # --- OWSM ---
+        status = f"{status}[{owsm_model.split('/')[-1]}]"
     _summary(out_dir, model_name, lang, info["tier"], len(out_rows), total / 3600,
              round(aw, 4), round(ac, 4), status)
     print(f"[{model_name}/{lang}] WER={aw:.4f}  CER={ac:.4f}  (ref='{tkey}')  -> {p}")
@@ -351,12 +477,26 @@ def selftest():
     assert supported("mms", "santali")
     assert supported("indicconformer", "santali")
     assert supported("indicconformer", "bodo")
+    assert supported("owsm", "santali")
     assert LANGS["bodo"]["ic"] == "brx" and LANGS["dogri"]["ic"] == "doi"
+    # --- OWSM --- every language carries an ISO-639-3 code, and Dogri does NOT
+    # inherit the MMS spelling
+    assert all("owsm" in v for v in LANGS.values())
+    assert LANGS["dogri"]["owsm"] == "doi" and LANGS["dogri"]["mms"] == "dgo"
+    # 30 s windowing: short clip -> 1 padded window; 70 s -> 3 windows
+    import numpy as np
+    assert len(_owsm_windows(np.zeros(16000, dtype="float32"))) == 1
+    assert len(_owsm_windows(np.zeros(16000, dtype="float32"))[0]) == OWSM_WINDOW
+    assert len(_owsm_windows(np.zeros(70 * 16000, dtype="float32"))) == 3
+    assert all(len(w) == OWSM_WINDOW
+               for w in _owsm_windows(np.zeros(70 * 16000, dtype="float32")))
+    assert _owsm_text([]) == ""
+    assert _owsm_text([("<eng><asr> hi", ["x"], [1], "hi", None)]) == "hi"
     print("OK: all self-tests passed.")
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
-        description="ASR eval: speecht5 (English-only) + mms + indicconformer.")
+        description="ASR eval: speecht5 (English-only) + mms + indicconformer + owsm.")
     ap.add_argument("--model", choices=MODELS)
     ap.add_argument("--lang", choices=list(LANGS) + ["all"])
     ap.add_argument("--data", default=None)
@@ -366,6 +506,9 @@ if __name__ == "__main__":
     ap.add_argument("--text-field", default="normalized")
     ap.add_argument("--decode", choices=["ctc", "rnnt"], default="ctc",
                     help="IndicConformer decoding strategy (ignored by other models)")
+    ap.add_argument("--owsm-model", default="espnet/owsm_v4_medium_1B",
+                    choices=OWSM_CHECKPOINTS,
+                    help="OWSM checkpoint (ignored by other models)")
     ap.add_argument("--force", action="store_true",
                     help="run speecht5 anyway to record English-model-on-Indic exclusion WER")
     ap.add_argument("--byte-exact", action="store_true")
@@ -379,11 +522,16 @@ if __name__ == "__main__":
 
     langs = list(LANGS) if a.lang == "all" else [a.lang]
 
-    # Load a multilingual model once and reuse it across all languages
+    # Load a multilingual model once and reuse it across all languages.
+    # OWSM is excluded on purpose: its language token is fixed at construction,
+    # so load_owsm() caches one instance per language internally instead.
     shared = None
     if a.lang == "all" and a.model == "indicconformer":
         shared = load_indicconformer("cuda" if _cuda() else "cpu", a.decode)
+    if a.lang == "all" and a.model == "owsm":
+        shared = load_owsm("cuda" if _cuda() else "cpu", a.owsm_model)
 
     for lg in langs:
         run(a.model, lg, a.hours, a.out, a.split, a.force, a.data,
-            not a.byte_exact, a.text_field, a.decode, transcribe=shared)
+            not a.byte_exact, a.text_field, a.decode, transcribe=shared,
+            owsm_model=a.owsm_model)
