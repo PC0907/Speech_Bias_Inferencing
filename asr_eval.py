@@ -35,7 +35,9 @@ Examples:
   python asr.py --model speecht5 --lang hindi   # coverage gap
   python asr.py --selftest
 """
-import argparse, csv, os, re, sys, unicodedata
+import argparse, csv, os, re, sys, time, unicodedata
+
+SCRIPT_VERSION = "owsm-r3"   # bump when editing; printed at startup
 
 MODELS = ["speecht5", "mms", "indicconformer", "owsm"]
 
@@ -383,8 +385,11 @@ def _cuda():
 # --------------------------------------------------------------------------
 def run(model_name, lang, hours, out_dir, split, force, data_ref, nfc, text_field,
         decode="ctc", transcribe=None, owsm_model="espnet/owsm_v4_medium_1B",
-        owsm_beam=5, owsm_fp16=True):
+        owsm_beam=5, owsm_fp16=True, progress_every=25, max_minutes=0):
     os.makedirs(out_dir, exist_ok=True)
+    print(f"=== asr.py {SCRIPT_VERSION} | {model_name}/{lang} | "
+          f"cuda={_cuda()} | beam={owsm_beam} fp16={owsm_fp16} "
+          f"progress_every={progress_every} ===", flush=True)
     info = LANGS[lang]
     ok = supported(model_name, lang)
 
@@ -442,12 +447,25 @@ def run(model_name, lang, hours, out_dir, split, force, data_ref, nfc, text_fiel
                   f"coverage gap, not scored.")
             return
 
+    print(f"[{model_name}/{lang}] model ready, starting inference on "
+          f"{len(rows)} utts...", flush=True)
     out_rows, W, C = [], [], []
     adapter_failed = False
+    n_err = 0
+    scored_secs = 0.0
+    budget_hit = False
+    _t0 = time.time()
     for i, ex in enumerate(rows):
+        if max_minutes and (time.time() - _t0) / 60 >= max_minutes:
+            budget_hit = True
+            print(f"  [{model_name}/{lang}] wall-clock budget {max_minutes}m hit "
+                  f"at utt {i}/{len(rows)} -> stopping, logging as partial.")
+            break
         try:
             audio, sr = extract_audio(ex[akey])
-            hyp = transcribe(to_16k(audio, sr), info)
+            a16 = to_16k(audio, sr)
+            hyp = transcribe(a16, info)
+            scored_secs += len(a16) / 16000
         except Exception as e:
             if _is_missing_adapter(e):
                 # adapter doesn't exist: log immediately, don't continue
@@ -456,6 +474,7 @@ def run(model_name, lang, hours, out_dir, split, force, data_ref, nfc, text_fiel
                 adapter_failed = True
                 break
             hyp = ""
+            n_err += 1
             print(f"  utt {i}: error -> empty hyp ({str(e)[:200]})")   # truncated
         ref = ex.get(tkey, "")
         w, c, rp, hp = score(ref, hyp, nfc)
@@ -463,6 +482,15 @@ def run(model_name, lang, hours, out_dir, split, force, data_ref, nfc, text_fiel
         out_rows.append({"idx": i, "reference": ref, "prediction": hyp,
                          "ref_prep": rp, "hyp_prep": hp,
                          "wer": round(w, 4), "cer": round(c, 4)})
+
+        if i == 0 or (i + 1) % progress_every == 0 or (i + 1) == len(rows):
+            el = time.time() - _t0
+            rate = (i + 1) / el
+            eta = (len(rows) - i - 1) / rate if rate else float("nan")
+            print(f"  [{model_name}/{lang}] {i+1}/{len(rows)}  "
+                  f"{rate:.2f} utt/s  elapsed {el/60:.1f}m  eta {eta/60:.1f}m  "
+                  f"running WER={sum(W)/len(W):.4f}  errs={n_err}",
+                  flush=True)
 
     if adapter_failed or not out_rows:
         return
@@ -478,9 +506,17 @@ def run(model_name, lang, hours, out_dir, split, force, data_ref, nfc, text_fiel
         status = f"{status}[{decode}]"
     if model_name == "owsm":                            # --- OWSM ---
         status = f"{status}[{owsm_model.split('/')[-1]}]"
-    _summary(out_dir, model_name, lang, info["tier"], len(out_rows), total / 3600,
+    if budget_hit:
+        # Do NOT report this as a clean 2 h row -- it is a different, smaller
+        # sample than the languages that finished, and averaging it into a
+        # tier comparison without the flag would be misleading.
+        status = f"{status}[partial {len(out_rows)}/{len(rows)}]"
+    # audio_hours = what was actually scored, not what was selected
+    _summary(out_dir, model_name, lang, info["tier"], len(out_rows),
+             scored_secs / 3600 if scored_secs else total / 3600,
              round(aw, 4), round(ac, 4), status)
-    print(f"[{model_name}/{lang}] WER={aw:.4f}  CER={ac:.4f}  (ref='{tkey}')  -> {p}")
+    print(f"[{model_name}/{lang}] WER={aw:.4f}  CER={ac:.4f}  (ref='{tkey}')  "
+          f"n={len(out_rows)}  scored={scored_secs/3600:.2f}h  errs={n_err}  -> {p}")
 
 def _summary(out_dir, model, lang, tier, n, hrs, w, c, status):
     p = os.path.join(out_dir, "summary.csv")
@@ -544,6 +580,11 @@ if __name__ == "__main__":
                     help="OWSM beam size; 1 = greedy, much lower peak memory")
     ap.add_argument("--owsm-fp32", action="store_true",
                     help="run OWSM in fp32 (default is fp16 on CUDA)")
+    ap.add_argument("--progress-every", type=int, default=25,
+                    help="print rate/ETA every N utterances")
+    ap.add_argument("--max-minutes", type=float, default=0,
+                    help="wall-clock budget per language; 0 = no limit. "
+                         "Stops cleanly and flags the row as partial.")
     ap.add_argument("--force", action="store_true",
                     help="run speecht5 anyway to record English-model-on-Indic exclusion WER")
     ap.add_argument("--byte-exact", action="store_true")
@@ -571,4 +612,5 @@ if __name__ == "__main__":
         run(a.model, lg, a.hours, a.out, a.split, a.force, a.data,
             not a.byte_exact, a.text_field, a.decode, transcribe=shared,
             owsm_model=a.owsm_model, owsm_beam=a.owsm_beam,
-            owsm_fp16=not a.owsm_fp32)
+            owsm_fp16=not a.owsm_fp32, progress_every=a.progress_every,
+            max_minutes=a.max_minutes)
