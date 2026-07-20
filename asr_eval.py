@@ -297,19 +297,24 @@ def _owsm_text(result):
             return c
     return ""
 
-def load_owsm(device, model_id="espnet/owsm_v4_medium_1B", beam_size=5):
+def load_owsm(device, model_id="espnet/owsm_v4_medium_1B", beam_size=5,
+              fp16=True):
     """
-    OWSM via ESPnet. Two things differ from the transformers models above:
+    OWSM via ESPnet. Three things differ from the transformers models above:
 
     1. The language token is baked in at Speech2Text construction time, so we
-       build (and cache) one instance per language. Weights come from the local
-       cache after the first build, so the cost is init not download -- but
-       still ~20-40 s per new language.
-    2. Coverage is checked against the checkpoint's own token list. No
-       hardcoded supported-language list.
-
-    CTC checkpoints (owsm_ctc_*) use a different inference class; handled below.
+       build one instance per language. AT MOST ONE lives on the GPU at a time
+       -- a 1B model is ~4 GB in fp32, and two of them plus beam-search
+       activations will OOM a 16 GB card. Switching language evicts the
+       previous instance.
+    2. Coverage is read off the checkpoint's own token list. The probe used to
+       read it is built on CPU and freed immediately, so it never occupies GPU
+       memory. No hardcoded supported-language list.
+    3. CTC checkpoints (owsm_ctc_*) use a different inference class.
     """
+    import gc
+    import torch
+
     is_ctc = "ctc" in model_id
     if is_ctc:
         from espnet2.bin.s2t_inference_ctc import Speech2TextGreedySearch as S2T
@@ -318,22 +323,47 @@ def load_owsm(device, model_id="espnet/owsm_v4_medium_1B", beam_size=5):
         from espnet2.bin.s2t_inference import Speech2Text as S2T
         kw = {"beam_size": beam_size}
 
-    cache = {}
+    use_cuda = str(device).startswith("cuda")
+    if fp16 and use_cuda:
+        kw["dtype"] = "float16"
+
+    # Read the token list on CPU, then drop it. Costs host RAM briefly
+    # (Kaggle has ~29 GB) and zero GPU.
     probe = S2T.from_pretrained(model_id, lang_sym="<eng>", task_sym="<asr>",
-                                device=device, **kw)
+                                device="cpu",
+                                **{k: v for k, v in kw.items() if k != "dtype"})
     token_list = set(getattr(probe.converter, "token_list", []))
-    cache["eng"] = probe
+    del probe
+    gc.collect()
+
+    live = {"code": None, "s2t": None}
 
     def _for(code):
-        if code in cache:
-            return cache[code]
-        cache[code] = S2T.from_pretrained(model_id, lang_sym=f"<{code}>",
+        if live["code"] == code:
+            return live["s2t"]
+        if live["s2t"] is not None:          # evict before allocating the next
+            live["s2t"] = None
+            live["code"] = None
+            gc.collect()
+            if use_cuda:
+                torch.cuda.empty_cache()
+        live["s2t"] = S2T.from_pretrained(model_id, lang_sym=f"<{code}>",
                                           task_sym="<asr>", device=device, **kw)
-        return cache[code]
+        live["code"] = code
+        return live["s2t"]
 
     def transcribe(audio16k, lang):
         s2t = _for(lang["owsm"])
-        return " ".join(_owsm_text(s2t(w)) for w in _owsm_windows(audio16k)).strip()
+        try:
+            out = " ".join(_owsm_text(s2t(w))
+                           for w in _owsm_windows(audio16k)).strip()
+        finally:
+            # Beam-search hypotheses are freed by refcount, but the caching
+            # allocator holds the blocks; without this the high-water mark
+            # creeps up across utterances until it OOMs.
+            if use_cuda:
+                torch.cuda.empty_cache()
+        return out
 
     transcribe.covers = lambda code: f"<{code}>" in token_list
     transcribe.model_id = model_id
@@ -352,7 +382,8 @@ def _cuda():
 
 # --------------------------------------------------------------------------
 def run(model_name, lang, hours, out_dir, split, force, data_ref, nfc, text_field,
-        decode="ctc", transcribe=None, owsm_model="espnet/owsm_v4_medium_1B"):
+        decode="ctc", transcribe=None, owsm_model="espnet/owsm_v4_medium_1B",
+        owsm_beam=5, owsm_fp16=True):
     os.makedirs(out_dir, exist_ok=True)
     info = LANGS[lang]
     ok = supported(model_name, lang)
@@ -383,7 +414,7 @@ def run(model_name, lang, hours, out_dir, split, force, data_ref, nfc, text_fiel
         elif model_name == "indicconformer":
             transcribe = load_indicconformer(device, decode)
         elif model_name == "owsm":                      # --- OWSM ---
-            transcribe = load_owsm(device, owsm_model)
+            transcribe = load_owsm(device, owsm_model, owsm_beam, owsm_fp16)
         else:
             transcribe = load_speecht5(device)
 
@@ -509,6 +540,10 @@ if __name__ == "__main__":
     ap.add_argument("--owsm-model", default="espnet/owsm_v4_medium_1B",
                     choices=OWSM_CHECKPOINTS,
                     help="OWSM checkpoint (ignored by other models)")
+    ap.add_argument("--owsm-beam", type=int, default=5,
+                    help="OWSM beam size; 1 = greedy, much lower peak memory")
+    ap.add_argument("--owsm-fp32", action="store_true",
+                    help="run OWSM in fp32 (default is fp16 on CUDA)")
     ap.add_argument("--force", action="store_true",
                     help="run speecht5 anyway to record English-model-on-Indic exclusion WER")
     ap.add_argument("--byte-exact", action="store_true")
@@ -529,9 +564,11 @@ if __name__ == "__main__":
     if a.lang == "all" and a.model == "indicconformer":
         shared = load_indicconformer("cuda" if _cuda() else "cpu", a.decode)
     if a.lang == "all" and a.model == "owsm":
-        shared = load_owsm("cuda" if _cuda() else "cpu", a.owsm_model)
+        shared = load_owsm("cuda" if _cuda() else "cpu", a.owsm_model,
+                           a.owsm_beam, not a.owsm_fp32)
 
     for lg in langs:
         run(a.model, lg, a.hours, a.out, a.split, a.force, a.data,
             not a.byte_exact, a.text_field, a.decode, transcribe=shared,
-            owsm_model=a.owsm_model)
+            owsm_model=a.owsm_model, owsm_beam=a.owsm_beam,
+            owsm_fp16=not a.owsm_fp32)
